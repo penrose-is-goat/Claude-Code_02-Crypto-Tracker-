@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+crypto_tracker/data/
+*.db
+*.sqlite3
+.env
+*.egg-info/
+dist/
+build/

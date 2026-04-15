@@ -1,29 +1,39 @@
 """
-SEC EDGAR Scraper for Crypto Filing Tracker.
+SEC EDGAR Scraper v1.1.26 — Rebuilt to use edgartools Filing objects.
 
-Searches EDGAR full-text search for crypto-related filings,
-downloads filing documents, extracts risk sections, and stores in database.
+v24/v25 APPROACH (broken):
+- Used raw HTTP to download documents from filing index pages
+- Manually parsed HTML and searched for risk sections with regex
+- Frequently downloaded wrong documents or missed the primary filing
+
+v1.1.26 APPROACH:
+- Uses edgartools' search_filings() for discovery (same as before)
+- Uses get_by_accession_number() to get a proper Filing object
+- Uses Filing.text(), Filing.sections(), Filing.search() for extraction
+- Uses Filing.attachments for multi-document filings
+- Stores full document text + risk section + summary in SQLite
+- Incremental: only processes new filings not already in the database
 """
 import re
 import time
 import threading
+import traceback
 import unicodedata
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-from bs4 import BeautifulSoup
-from edgar import set_identity, search_filings
+from edgar import set_identity, search_filings, get_by_accession_number
 
 from . import config
 from . import database as db
 from .extractor import (
-    html_to_structured_text,
-    extract_risk_section,
-    extract_risk_section_quick,
-    get_filing_pdf_url,
+    extract_risk_from_filing,
+    get_filing_url,
     CRYPTO_RE,
-    _score_crypto_risk,
+    _has_sufficient_crypto_content,
+    _extract_risk_from_text,
+    _extract_document_body,
+    _html_to_text,
 )
 from .summarizer import build_summary
 
@@ -31,125 +41,6 @@ from .summarizer import build_summary
 set_identity(config.SEC_IDENTITY)
 
 _lock = threading.Lock()
-
-
-def _download_url(url):
-    """Download a single document URL. Returns (raw_html, structured_text) or (None, None)."""
-    try:
-        r = requests.get(url, headers=config.SEC_HEADERS, timeout=config.HTTP_TIMEOUT)
-        if r.status_code == 200 and len(r.text) > 500:
-            raw_html = r.text
-            text = html_to_structured_text(raw_html)
-            return raw_html, text
-    except Exception:
-        pass
-    return None, None
-
-
-def _get_index_urls(filing_url):
-    """Get all document URLs from a filing index page."""
-    urls = []
-    try:
-        r = requests.get(filing_url, headers=config.SEC_HEADERS, timeout=15)
-        if r.status_code != 200:
-            return urls
-        soup = BeautifulSoup(r.text, "html.parser")
-        for row in soup.find_all("tr"):
-            a = row.find("a")
-            if a:
-                href = a.get("href", "")
-                if (
-                    href.endswith((".htm", ".html"))
-                    and "index" not in href.lower()
-                    and "R1" not in href
-                ):
-                    full_url = (
-                        f"https://www.sec.gov{href}" if href.startswith("/") else href
-                    )
-                    urls.append(full_url)
-    except Exception:
-        pass
-    return urls
-
-
-def _get_document_urls(filing_url):
-    """Get document URLs including PDF links from a filing index page."""
-    doc_urls = []
-    pdf_url = ""
-    try:
-        r = requests.get(filing_url, headers=config.SEC_HEADERS, timeout=15)
-        if r.status_code != 200:
-            return doc_urls, pdf_url
-        soup = BeautifulSoup(r.text, "html.parser")
-        for row in soup.find_all("tr"):
-            a = row.find("a")
-            if not a:
-                continue
-            href = a.get("href", "")
-            full_url = f"https://www.sec.gov{href}" if href.startswith("/") else href
-
-            if href.endswith(".pdf") and not pdf_url:
-                pdf_url = full_url
-            elif (
-                href.endswith((".htm", ".html"))
-                and "index" not in href.lower()
-                and "R1" not in href
-            ):
-                doc_urls.append(full_url)
-    except Exception:
-        pass
-    return doc_urls, pdf_url
-
-
-def _download_best_document(cik, accession_no):
-    """Download filing documents and select the one with the best crypto risk section.
-
-    KEY IMPROVEMENT: Scores each document individually by crypto*risk density.
-    In multi-fund filings, the crypto fund's prospectus scores highest.
-    Returns (best_raw_html, best_text, all_text_combined, pdf_url).
-    """
-    cik_clean = cik.lstrip("0")
-    acc_clean = accession_no.replace("-", "")
-    base = f"https://www.sec.gov/Archives/edgar/data/{cik_clean}/{acc_clean}"
-    filing_url = f"{base}/{accession_no}-index.htm"
-
-    doc_urls, pdf_url = _get_document_urls(filing_url)
-    if not doc_urls:
-        return None, None, None, pdf_url
-
-    best_html = None
-    best_text = None
-    best_score = 0
-    all_texts = []
-
-    for url in doc_urls[: config.MAX_DOCS_PER_FILING]:
-        raw_html, text = _download_url(url)
-        if not text or len(text) < 300:
-            continue
-        all_texts.append(text)
-
-        # Score this document's risk section
-        risk_sec = extract_risk_section_quick(text)
-        if risk_sec and len(risk_sec) > 800:
-            score = _score_crypto_risk(risk_sec)
-            if score > best_score:
-                best_score = score
-                best_html = raw_html
-                best_text = text
-
-        time.sleep(config.DOWNLOAD_DELAY)
-
-    if not all_texts:
-        return None, None, None, pdf_url
-
-    # If we found a clearly best document, use it
-    if best_text and best_score > 5:
-        combined = "\n\n".join(all_texts)
-        return best_html, best_text, combined, pdf_url
-
-    # Otherwise combine all documents
-    combined = "\n\n".join(all_texts)
-    return None, combined, combined, pdf_url
 
 
 def _clean_text(text):
@@ -164,10 +55,10 @@ def _clean_text(text):
 
 
 def _detect_crypto_connection(text, root_form):
-    """Generate a short description of how this filing relates to crypto."""
+    """Generate a description of how this filing relates to crypto."""
     if not text:
         return "Crypto-related filing."
-    tokens = list(set(t.lower() for t in CRYPTO_RE.findall(text[:3000])))[:5]
+    tokens = list(set(t.lower() for t in CRYPTO_RE.findall(text[:5000])))[:5]
     if not tokens:
         return "Crypto-related filing."
 
@@ -176,55 +67,67 @@ def _detect_crypto_connection(text, root_form):
         return f"Proposes {joined} ETF, fund, or security offering."
     elif root_form in ("10-K", "10-Q"):
         return f"Reports {joined} operations with risk disclosures."
+    elif root_form == "8-K":
+        return f"Discloses {joined} material event or corporate action."
+    elif root_form == "D":
+        return f"Exempt offering related to {joined}."
     else:
-        return f"Discloses {joined} material event."
+        return f"Filing related to {joined}."
+
+
+def _detect_filing_pdf_url(filing):
+    """Try to find a PDF attachment URL for the filing."""
+    try:
+        attachments = filing.attachments
+        if attachments and attachments.documents:
+            for doc in attachments.documents:
+                if hasattr(doc, 'url') and doc.url and doc.url.endswith('.pdf'):
+                    return doc.url
+    except Exception:
+        pass
+    return ""
 
 
 def process_one_filing(item):
-    """Process a single filing: download, extract risk section, build summary.
+    """Process a single filing using edgartools Filing object.
+
+    This is the core improvement: instead of raw HTTP downloads and regex parsing,
+    we use edgartools' built-in document access and section parsing.
 
     Args:
         item: tuple of (accession_no, cik, company_name, ticker, form_type,
               root_form, filing_date, tier, keyword)
 
     Returns:
-        dict of filing data ready for database insertion, or None on failure.
+        dict ready for database insertion, or None on failure.
     """
     acc, cik, company_name, ticker, form_type, root_form, filed, tier, kw = item
 
     try:
-        best_html, best_text, all_text, pdf_url = _download_best_document(cik, acc)
-
-        text = best_text or all_text
-        if not text or len(text) < 300:
+        # Get the Filing object from edgartools
+        filing = get_by_accession_number(acc)
+        if filing is None:
             return None
 
-        # Extract risk section — try HTML-aware first, then text-based
-        risk_section = ""
-        if best_html:
-            risk_section = extract_risk_section(raw_html=best_html)
-        if not risk_section or len(risk_section) < 500:
-            risk_section = extract_risk_section(plain_text=text)
+        # Extract risk section using the new edgartools-based extractor
+        risk_section, full_text = extract_risk_from_filing(filing)
 
-        # Build summary from risk section (or full text as fallback)
-        source_text = risk_section if risk_section else text
-        summary = build_summary(source_text)
+        if not full_text or len(full_text) < 200:
+            return None
+
+        # Build summary from risk section (or full text for non-risk filings)
+        source_text = risk_section if (risk_section and len(risk_section) > 200) else full_text
+        summary = build_summary(source_text, form_type=form_type, company_name=company_name)
         if not summary:
             return None
 
-        # Guarantee dropdown content — triple fallback
-        if not risk_section or len(risk_section) < 150:
-            risk_section = extract_risk_section(plain_text=all_text or text)
-        if not risk_section or len(risk_section) < 80:
-            match = CRYPTO_RE.search(text)
-            if match:
-                start = max(0, match.start() - 500)
-                risk_section = text[start : start + 10000]
-            else:
-                risk_section = text[:10000]
+        # Guarantee some content for the dropdown
+        if not risk_section or len(risk_section) < 100:
+            risk_section = _extract_document_body(full_text)
 
-        crypto_connection = _detect_crypto_connection(text, root_form)
-        sec_url = get_filing_pdf_url(cik, acc)
+        crypto_connection = _detect_crypto_connection(full_text, root_form)
+        sec_url = get_filing_url(cik, acc)
+        pdf_url = _detect_filing_pdf_url(filing)
         category = "ETF/Fund" if root_form in config.ETF_FUND_FORMS else "Operating Co."
 
         return {
@@ -237,23 +140,28 @@ def process_one_filing(item):
             "filing_date": filed,
             "filing_category": category,
             "tier": tier,
-            "text_length": len(text),
+            "text_length": len(full_text),
             "risk_summary": _clean_text(summary),
-            "risk_section": risk_section[:80000],
+            "risk_section": risk_section[:100000],
             "crypto_connection": _clean_text(crypto_connection),
             "sec_url": sec_url,
-            "filing_pdf_url": pdf_url or "",
+            "filing_pdf_url": pdf_url,
             "search_keyword": kw,
             "n_risk_paras": risk_section.count("\n\n") + 1 if risk_section else 0,
             "processed_at": datetime.now().isoformat(),
         }
 
-    except Exception:
+    except Exception as e:
+        # Log the error for debugging
+        try:
+            print(f"    ERROR processing {acc}: {str(e)[:100]}")
+        except Exception:
+            pass
         return None
 
 
 def search_edgar_filings():
-    """Search SEC EDGAR for crypto-related filings across all form types and keywords.
+    """Search SEC EDGAR for crypto-related filings.
 
     Returns:
         list of tuples: (accession_no, cik, company_name, ticker, form_type,
@@ -303,11 +211,11 @@ def search_edgar_filings():
 
                     fa = r.form or form_type
                     rf = re.sub(r"/A$", "", fa)
-                    tier = 1 if rf in config.ETF_FUND_FORMS else 2
+                    tier_val = 1 if rf in config.ETF_FUND_FORMS else 2
                     ck = str(r.cik or "").lstrip("0")
                     fd = str(r.filed) if r.filed else ""
 
-                    todo.append((acc, ck, company_name, ticker, fa, rf, fd, tier, kw))
+                    todo.append((acc, ck, company_name, ticker, fa, rf, fd, tier_val, kw))
                     added += 1
                     form_count += 1
 
@@ -330,13 +238,16 @@ def search_edgar_filings():
 def run_scraper(progress_callback=None):
     """Run the full scraping pipeline: search, download, extract, save.
 
+    Uses edgartools get_by_accession_number() for each filing instead of
+    raw HTTP downloads. This is slower per filing but much more accurate.
+
     Args:
         progress_callback: Optional callable(current, total, saved, failed)
-            for progress updates.
 
     Returns:
-        dict with stats: {new_found, saved, failed, total_in_db}
+        dict with stats: {new_found, saved, failed, total_in_db, duration_seconds}
     """
+    start_time = time.time()
     db.init_db()
 
     # Step 1: Search
@@ -344,22 +255,30 @@ def run_scraper(progress_callback=None):
 
     if not todo:
         total = db.get_filing_count()
+        duration = time.time() - start_time
         print(f"\n  No new filings — {total} in database")
-        return {"new_found": 0, "saved": 0, "failed": 0, "total_in_db": total}
+        return {
+            "new_found": 0, "saved": 0, "failed": 0,
+            "total_in_db": total, "duration_seconds": duration,
+        }
 
-    # Step 2: Download and process in parallel
-    print(f"\n  Downloading + analyzing ({len(todo)} filings, {config.NUM_THREADS} threads)")
+    # Step 2: Download and process
+    # Note: Using fewer threads because edgartools Filing objects do more
+    # network requests per filing (sections, search, attachments)
+    num_threads = min(config.NUM_THREADS, 4)
+    print(f"\n  Processing {len(todo)} filings ({num_threads} threads)")
+    print(f"  Using edgartools Filing objects for proper document parsing")
 
     saved = 0
     failed = 0
 
-    with ThreadPoolExecutor(max_workers=config.NUM_THREADS) as executor:
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = {executor.submit(process_one_filing, item): item for item in todo}
         total = len(futures)
 
         for i, future in enumerate(as_completed(futures), 1):
             try:
-                result = future.result(timeout=120)
+                result = future.result(timeout=180)  # 3 min timeout per filing
             except Exception:
                 result = None
                 failed += 1
@@ -368,25 +287,28 @@ def run_scraper(progress_callback=None):
                 with _lock:
                     db.insert_filing(result)
                     saved += 1
-                    if saved % 50 == 0:
+                    if saved % 25 == 0:
                         db.commit()
 
             if progress_callback:
                 progress_callback(i, total, saved, failed)
 
-            if i % 25 == 0:
+            if i % 20 == 0:
                 print(f"    [{i}/{total}] saved={saved} failed={failed}")
 
     db.commit()
 
+    duration = time.time() - start_time
     total_in_db = db.get_filing_count()
     print(f"\n  {saved} saved, {failed} failed")
     print(f"  {len(todo) - saved - failed} dropped (no crypto risk content)")
     print(f"  Total in database: {total_in_db}")
+    print(f"  Duration: {duration:.0f}s ({duration/60:.1f}min)")
 
     return {
         "new_found": len(todo),
         "saved": saved,
         "failed": failed,
         "total_in_db": total_in_db,
+        "duration_seconds": duration,
     }

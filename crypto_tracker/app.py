@@ -120,7 +120,22 @@ def filing_detail(accession_no):
     if not filing:
         return "Filing not found", 404
     filing["risk_html"] = format_risk_for_html(filing.get("risk_section", ""))
-    return render_template("filing_detail.html", filing=filing, form_desc=config.FORM_DESCRIPTIONS)
+    return render_template("filing_detail.html", filing=filing, form_desc=config.FORM_DESCRIPTIONS,
+                           now=datetime.now())
+
+
+@app.route("/settings")
+def settings_page():
+    """Settings and system information page."""
+    db.init_db()
+    db_count = db.get_filing_count()
+    return render_template(
+        "settings.html",
+        config=config,
+        scraper_status=_scraper_status,
+        db_count=db_count,
+        now=datetime.now(),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

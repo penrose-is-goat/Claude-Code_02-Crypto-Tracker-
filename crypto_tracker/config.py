@@ -5,6 +5,10 @@ Edit these settings to customize scraping behavior, database location, etc.
 import os
 from datetime import datetime
 
+# ─── Version ──────────────────────────────────────────────────────────────
+VERSION = "1.1.26"
+VERSION_NAME = "Batch 1 — SEC Filing Tracker"
+
 # ─── Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")

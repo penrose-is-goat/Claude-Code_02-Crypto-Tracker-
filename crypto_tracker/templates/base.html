@@ -15,13 +15,14 @@
             <a href="/" class="nav-brand">
                 <span class="nav-icon">&#9878;</span>
                 <div>
-                    <div class="nav-title">CRYPTO SEC FILING TRACKER</div>
+                    <div class="nav-title">CRYPTO SEC FILING TRACKER <span style="font-size:9px;color:#6366f1;font-weight:400;">v1.1.26</span></div>
                     <div class="nav-sub">For Crypto Lawyers | SEC EDGAR | Interactive Dashboard</div>
                 </div>
             </a>
             <div class="nav-links">
                 <a href="/" class="nav-link {% if request.path == '/' %}active{% endif %}">Dashboard</a>
                 <a href="/filings" class="nav-link {% if '/filings' in request.path %}active{% endif %}">All Filings</a>
+                <a href="/settings" class="nav-link {% if '/settings' in request.path %}active{% endif %}">Settings</a>
                 <div class="nav-actions">
                     <button id="btn-scrape" class="btn btn-primary" onclick="startScraper()">
                         <span id="scrape-icon">&#9881;</span> Update Filings

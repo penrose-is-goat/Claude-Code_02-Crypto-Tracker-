@@ -398,6 +398,24 @@ def get_filtered_filings(company=None, form_type=None, month=None,
 # EXPORTS
 # ═══════════════════════════════════════════════════════════════════════════
 
+_ILLEGAL_XML_RE = None
+
+
+def _sanitize_for_excel(value):
+    """Strip control characters that openpyxl rejects (\\x00-\\x08, \\x0B, \\x0C,
+    \\x0E-\\x1F). Also cap cell length at Excel's 32,767 char limit."""
+    global _ILLEGAL_XML_RE
+    if _ILLEGAL_XML_RE is None:
+        import re as _re
+        _ILLEGAL_XML_RE = _re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+    if not isinstance(value, str):
+        return value
+    cleaned = _ILLEGAL_XML_RE.sub(" ", value)
+    if len(cleaned) > 32767:
+        cleaned = cleaned[:32764] + "..."
+    return cleaned
+
+
 def export_to_csv(filepath=None):
     import csv
     if filepath is None:
@@ -428,6 +446,10 @@ def export_to_excel(filepath=None):
     filings = get_all_filings()
     if not filings:
         return None
-    df = pd.DataFrame(filings)
+    sanitized = [
+        {k: _sanitize_for_excel(v) for k, v in row.items()}
+        for row in filings
+    ]
+    df = pd.DataFrame(sanitized)
     df.to_excel(filepath, index=False, engine="openpyxl")
     return filepath

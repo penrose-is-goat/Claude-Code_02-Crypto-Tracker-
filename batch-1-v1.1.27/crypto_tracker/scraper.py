@@ -128,9 +128,10 @@ def search_edgar_filings():
                 forms=[form_type],
                 start_date=config.START_DATE,
                 end_date=config.END_DATE,
+                limit=100,  # EFTS max per request
             )
             added = 0
-            max_per_form = config.MAX_PER_KEYWORD * len(config.KEYWORDS)
+            max_per_form = 100  # Match EFTS API max
 
             for r in results:
                 if added >= max_per_form:
@@ -237,6 +238,8 @@ def process_one_filing(item):
         )
 
         # 6) Compose records for the normalized tables
+        if not kw:
+            kw = _pick_matched_keyword(full_text[:5000])
         meta = {
             "accession_no": acc,
             "cik": cik,

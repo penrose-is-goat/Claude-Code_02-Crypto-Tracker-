@@ -60,7 +60,7 @@
         <!-- Header Row -->
         <div class="filing-header">
             <div class="filing-header-left">
-                <a href="{{ f.sec_url }}" target="_blank" class="filing-company link">
+                <a href="/filing/{{ f.accession_no }}" class="filing-company link">
                     {{ f.company_name }}
                 </a>
                 {% if f.ticker %}
@@ -73,6 +73,19 @@
                     {{ f.filing_date[:10] if f.filing_date else 'N/A' }}
                     &middot; {{ f.filing_category }}
                     &middot; {{ '{:,}'.format(f.text_length) }}ch
+                    {% if f.extraction_confidence %}
+                    &middot;
+                    {% if f.extraction_confidence >= 0.7 %}
+                        <span style="color:#86efac;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% elif f.extraction_confidence >= 0.4 %}
+                        <span style="color:#fcd34d;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% else %}
+                        <span style="color:#fca5a5;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% endif %}
+                    {% endif %}
+                    {% if f.extraction_method %}
+                    &middot; <span style="color:#64748b;">{{ f.extraction_method }}</span>
+                    {% endif %}
                 </span>
             </div>
             <div class="filing-header-right">

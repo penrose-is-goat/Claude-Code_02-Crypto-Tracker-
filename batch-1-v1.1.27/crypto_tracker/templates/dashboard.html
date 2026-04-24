@@ -203,7 +203,7 @@ function loadFilings() {
                 const desc = formDescriptions[f.form_type] || f.form_type;
 
                 return `<tr>
-                    <td class="cell"><a href="${escHtml(f.sec_url)}" target="_blank" class="link">${escHtml(f.company_name)}</a></td>
+                    <td class="cell"><a href="/filing/${encodeURIComponent(f.accession_no)}" class="link">${escHtml(f.company_name)}</a></td>
                     <td class="cell">${escHtml(f.ticker || '')}</td>
                     <td class="cell"><span class="badge ${formClass}">${escHtml(f.form_type)}</span></td>
                     <td class="cell">${escHtml(desc)}</td>

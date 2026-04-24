@@ -15,7 +15,8 @@ python run.py
 
 | Version | Folder | Status | Notes |
 |---------|--------|--------|-------|
-| **v1.1.26** | [`batch-1-v1.1.26/`](batch-1-v1.1.26/) | Current — ready to test | Rewrote extraction using edgartools Filing objects. Added settings page, test suite, README. |
+| **v1.1.27** | [`batch-1-v1.1.27/`](batch-1-v1.1.27/) | Current — ready to test | Major rewrite: normalized DB (4 tables), edgartools local cache, collapsed OR-query search, boundary-pair + prospectus-header extraction, Claude Haiku summaries. 19/19 unit tests pass. |
+| v1.1.26 | [`batch-1-v1.1.26/`](batch-1-v1.1.26/) | Superseded | Took 2 hours to run; extraction bugs persisted across TOC, fee schedules, and multi-fund filings. |
 | v1.1.25 | [`batch-1-v1.1.25/`](batch-1-v1.1.25/) | Superseded | Initial Flask rebuild. Extraction had issues (wrong sections, fee schedules, partial results). |
 | Pre-1.0 (v24) | `crypto_tracker_v24.py` | Reference only | Original Colab notebook — monolithic script producing static HTML. |
 
@@ -41,4 +42,4 @@ Each version folder is self-contained with its own `crypto_tracker/`, `requireme
 
 ## Which Version Should I Run?
 
-**Run the highest version number that's marked "ready to test" or "stable".** Currently: `batch-1-v1.1.26/`.
+**Run the highest version number that's marked "ready to test" or "stable".** Currently: `batch-1-v1.1.27/`.

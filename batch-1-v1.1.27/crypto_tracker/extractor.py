@@ -355,55 +355,36 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
                            form_type: str = "") -> List[Dict]:
     """Run all extraction strategies and return ranked candidates.
 
-    Each candidate dict has:
-      { section_type, method, title, text, confidence, signals }
-
-    Strategies attempted (in order):
-      A) edgartools Filing.sections() / .risk_factors property
-      B) Boundary-pair regex on cleaned HTML (for 10-K, 10-Q)
-      C) Prospectus header regex (for S-1, N-1A, 485APOS)
-      D) Boundary-pair on raw text (fallback if HTML cleaning failed)
-      E) Paragraph-density scoring (last-resort)
-
-    Each candidate is independently validated. Only valid ones are kept.
+    Strategy order (best-first):
+      A) edgartools typed object (TenK.risk_factors, TenQ['Part II, Item 1A'],
+         CurrentReport.sections) — the library's HTMLParser already does smart
+         section detection w/ TOC handling, Cross-Reference Index, etc.
+      B) Item code boundary-pair regex (10-K/10-Q only) for filings where the
+         typed parser comes back empty.
+      C) Prospectus header extraction (S-1, N-1A, 485APOS, etc).
+      D) Lenient boundary-pair (1A → 2) for 10-K/10-Q.
+      E) Paragraph-density crypto filter (last-resort).
     """
     candidates = []
     root = re.sub(r"/A$", "", form_type)
 
-    # Prefer cleaned text from HTML when we have it
+    # Prefer cleaned HTML text for downstream regex strategies
     if html:
         cleaned_text = clean_html_to_text(html)
         if len(cleaned_text) > len(full_text) / 2:
             full_text = cleaned_text
 
-    # ─── A) edgartools Filing.sections() ─────────────────────────────────
-    try:
-        sections = filing.sections() if hasattr(filing, "sections") else None
-        if sections:
-            for i, sec in enumerate(sections):
-                sec_str = sec if isinstance(sec, str) else str(sec)
-                if len(sec_str) < 1000:
-                    continue
-                v = validate_section(sec_str)
-                if v["valid"]:
-                    candidates.append({
-                        "section_type": "risk_factors",
-                        "method": "edgartools_sections",
-                        "title": f"Section #{i}",
-                        "text": sec_str,
-                        "confidence": v["score"],
-                        "signals": v["signals"],
-                    })
-    except Exception:
-        pass
+    # ─── A) edgartools typed object (the right tool for the job) ─────────
+    typed_candidates = _extract_via_edgartools_obj(filing, root)
+    candidates.extend(typed_candidates)
 
-    # ─── B) Boundary-pair regex for 10-K / 10-Q ──────────────────────────
-    if root in ("10-K", "10-Q"):
+    # ─── B) Boundary-pair regex for 10-K / 10-Q (when A came up empty) ───
+    if root in ("10-K", "10-Q") and not candidates:
         boundaries = TENK_BOUNDARIES if root == "10-K" else TENQ_BOUNDARIES
         for section_type, start_code, end_code in boundaries:
             spans = extract_boundary_pair(full_text, start_code, end_code)
             if spans:
-                best = spans[0]  # largest span
+                best = spans[0]
                 v = validate_section(best["text"])
                 if v["valid"]:
                     candidates.append({
@@ -414,12 +395,12 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
                         "confidence": v["score"],
                         "signals": v["signals"],
                     })
-                    break  # found it — don't run other boundary pairs
+                    break
 
     # ─── C) Prospectus header extraction for fund forms ──────────────────
     if root in ("S-1", "N-1A", "485APOS", "485BPOS", "D"):
         spans = extract_prospectus_risk(full_text)
-        for span in spans[:3]:  # top 3 by length
+        for span in spans[:3]:
             v = validate_section(span["text"])
             if v["valid"]:
                 candidates.append({
@@ -431,9 +412,8 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
                     "signals": v["signals"],
                 })
 
-    # ─── D) Text-based boundary-pair (fallback) ──────────────────────────
+    # ─── D) Lenient boundary-pair fallback ───────────────────────────────
     if not candidates and root in ("10-K", "10-Q"):
-        # Retry with more lenient patterns
         spans = extract_boundary_pair(full_text, "1A", "2", min_chars=500)
         if spans:
             v = validate_section(spans[0]["text"])
@@ -443,11 +423,11 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
                     "method": "boundary_pair_lenient",
                     "title": "Item 1A (lenient)",
                     "text": spans[0]["text"],
-                    "confidence": v["score"] * 0.8,  # lower confidence
+                    "confidence": v["score"] * 0.8,
                     "signals": v["signals"],
                 })
 
-    # ─── E) Paragraph-density fallback ───────────────────────────────────
+    # ─── E) Paragraph-density crypto filter ──────────────────────────────
     if not candidates:
         para_text = extract_crypto_paragraphs(full_text)
         if para_text and len(para_text) > 500:
@@ -458,14 +438,12 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
                     "method": "paragraph_density",
                     "title": "Crypto-relevant paragraphs",
                     "text": para_text,
-                    "confidence": v["score"] * 0.6,  # lowest confidence
+                    "confidence": v["score"] * 0.6,
                     "signals": v["signals"],
                 })
 
-    # ─── Final sort: highest confidence wins ─────────────────────────────
     candidates.sort(key=lambda c: -c["confidence"])
 
-    # Deduplicate — don't keep near-identical candidates
     deduped = []
     for c in candidates:
         is_dup = any(
@@ -474,7 +452,98 @@ def extract_all_candidates(filing, full_text: str, html: str = "",
         )
         if not is_dup:
             deduped.append(c)
-    return deduped[:5]  # keep top 5 candidates
+    return deduped[:5]
+
+
+def _extract_via_edgartools_obj(filing, root: str) -> List[Dict]:
+    """Use the edgartools typed report object (TenK/TenQ/CurrentReport) to get
+    properly-parsed section text. The library's HTMLParser handles Cross-Reference
+    Index format (GE-style), combined items (Items 1 and 2), TOC tables, and
+    bold-paragraph fallback detection — much better than custom regex.
+    """
+    out = []
+    try:
+        obj = filing.obj()
+    except Exception:
+        return out
+    if obj is None:
+        return out
+
+    # 10-K: prefer .risk_factors (Item 1A); fall back to MD&A and Business if empty
+    if root == "10-K":
+        for label, accessor in [
+            ("risk_factors", "risk_factors"),
+            ("management_discussion", "management_discussion"),
+            ("business", "business"),
+        ]:
+            try:
+                text = getattr(obj, accessor, None)
+            except Exception:
+                text = None
+            if not text or not isinstance(text, str) or len(text) < 500:
+                continue
+            v = validate_section(text)
+            if v["valid"]:
+                out.append({
+                    "section_type": label,
+                    "method": f"edgartools_{accessor}",
+                    "title": f"TenK.{accessor}",
+                    "text": text,
+                    "confidence": v["score"],
+                    "signals": v["signals"],
+                })
+
+    # 10-Q: risk factors live in Part II, Item 1A
+    elif root == "10-Q":
+        for label, key in [
+            ("risk_factors", "Part II, Item 1A"),
+            ("legal_proceedings", "Part II, Item 1"),
+            ("mda", "Part I, Item 2"),
+        ]:
+            try:
+                text = obj[key] if hasattr(obj, "__getitem__") else None
+            except Exception:
+                text = None
+            if not text or not isinstance(text, str) or len(text) < 500:
+                continue
+            v = validate_section(text)
+            if v["valid"]:
+                out.append({
+                    "section_type": label,
+                    "method": "edgartools_tenq",
+                    "title": key,
+                    "text": text,
+                    "confidence": v["score"],
+                    "signals": v["signals"],
+                })
+
+    # 8-K: scan all detected items for crypto content (most relevant items are
+    # 7.01 Reg FD, 8.01 Other Events, 1.01 Material Agreement, 2.02 Results)
+    elif root == "8-K":
+        try:
+            sections = getattr(obj, "sections", {}) or {}
+        except Exception:
+            sections = {}
+        for key, sec in sections.items():
+            try:
+                text = sec.text() if hasattr(sec, "text") else str(sec)
+            except Exception:
+                continue
+            if not text or len(text) < 400:
+                continue
+            v = validate_section(text)
+            if v["valid"]:
+                out.append({
+                    "section_type": "current_report_item",
+                    "method": "edgartools_8k_item",
+                    "title": key,
+                    "text": text,
+                    "confidence": v["score"],
+                    "signals": v["signals"],
+                })
+
+    return out
+
 
 
 def _text_overlap(a: str, b: str) -> float:

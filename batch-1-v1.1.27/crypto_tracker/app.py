@@ -30,6 +30,12 @@ app = Flask(
 )
 app.secret_key = config.SECRET_KEY
 
+
+@app.context_processor
+def _inject_globals():
+    """Make config and version available to every template."""
+    return {"config": config}
+
 _scraper_status = {
     "running": False,
     "progress": 0,
@@ -209,6 +215,22 @@ def api_start_scraper():
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started"})
+
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset_db():
+    """Wipe all filing data. Useful when extraction logic changes and you
+    want a clean re-scrape from scratch."""
+    db.init_db()
+    conn = db.get_connection()
+    conn.executescript("""
+        DELETE FROM filing_summaries;
+        DELETE FROM filing_sections;
+        DELETE FROM filing_documents;
+        DELETE FROM filings;
+    """)
+    conn.commit()
+    return jsonify({"status": "ok", "message": "Database wiped. Press Update Filings to re-scrape."})
 
 
 @app.route("/api/reprocess", methods=["POST"])

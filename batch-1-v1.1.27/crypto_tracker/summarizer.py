@@ -30,10 +30,26 @@ def build_summary(text: str, form_type: str = "",
                   company_name: str = "") -> Tuple[str, str]:
     """Generate a summary. Returns (summary_text, model_name).
 
+    Quality gate: if the input text isn't substantively crypto-related (fewer
+    than 3 crypto term hits, or > 20% fee-schedule content), return empty so
+    the filing is dropped instead of producing a misleading summary.
+
     Tries Claude Haiku first if API key is set. Falls back to template on
     API failure, missing key, or empty text.
     """
-    if not text or len(text) < 100:
+    if not text or len(text) < 200:
+        return "", ""
+
+    sample = text[:30000]
+    crypto_hits = len(CRYPTO_RE.findall(sample))
+    risk_hits = len(RISK_RE.findall(sample))
+    fee_hits = len(FEE_SCHEDULE_RE.findall(sample))
+
+    if crypto_hits < 3:
+        return "", ""
+    if risk_hits < 5:
+        return "", ""
+    if risk_hits and fee_hits / risk_hits > 0.5:
         return "", ""
 
     if config.USE_CLAUDE_SUMMARIES and config.ANTHROPIC_API_KEY:

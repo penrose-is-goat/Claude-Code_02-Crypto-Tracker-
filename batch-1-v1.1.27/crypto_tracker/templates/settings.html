@@ -123,6 +123,17 @@
                 <a href="/api/export/xlsx" class="btn btn-sm" style="margin-left:4px;">Excel</a>
             </div>
         </div>
+        <div class="detail-item">
+            <div class="detail-label">Reset</div>
+            <div class="detail-value">
+                <button onclick="resetDb()" class="btn btn-sm" style="background:#7f1d1d;border-color:#dc2626;">
+                    Wipe Database
+                </button>
+                <div style="font-size:9px;color:#64748b;margin-top:2px;">
+                    Clears all filings. Run after extraction logic changes.
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -153,6 +164,15 @@
         </div>
     </div>
 </div>
+
+<script>
+function resetDb() {
+    if (!confirm("Wipe ALL filings from the database? You'll need to re-run Update Filings.")) return;
+    fetch('/api/reset', { method: 'POST' })
+        .then(r => r.json())
+        .then(d => { alert(d.message || 'Done'); location.reload(); });
+}
+</script>
 
 <!-- SCRAPER STATUS -->
 <div class="card">

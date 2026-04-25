@@ -201,10 +201,16 @@ def api_start_scraper():
         try:
             result = run_scraper(progress_callback=_scraper_progress)
             with _scraper_lock:
-                _scraper_status["message"] = (
-                    f"Done: {result['saved']} new, {result['failed']} failed, "
-                    f"{result['total_in_db']} total ({result['duration_seconds']/60:.1f}min)"
-                )
+                if result["new_found"] == 0 and result["total_in_db"] > 0:
+                    _scraper_status["message"] = (
+                        f"No new filings — {result['total_in_db']} already cached. "
+                        f"To re-run extraction with new logic, go to Settings -> Re-Extract All."
+                    )
+                else:
+                    _scraper_status["message"] = (
+                        f"Done: {result['saved']} new, {result['failed']} failed, "
+                        f"{result['total_in_db']} total ({result['duration_seconds']/60:.1f}min)"
+                    )
                 _scraper_status["last_run"] = datetime.now().isoformat()
         except Exception as e:
             with _scraper_lock:

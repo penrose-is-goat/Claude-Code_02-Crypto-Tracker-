@@ -124,6 +124,17 @@
             </div>
         </div>
         <div class="detail-item">
+            <div class="detail-label">Reprocess Cached</div>
+            <div class="detail-value">
+                <button onclick="reprocessCached()" class="btn btn-sm" style="background:#1e3a8a;border-color:#3b82f6;">
+                    Re-Extract All
+                </button>
+                <div style="font-size:9px;color:#64748b;margin-top:2px;">
+                    Re-run extraction + summary on cached filings. No re-download.
+                </div>
+            </div>
+        </div>
+        <div class="detail-item">
             <div class="detail-label">Reset</div>
             <div class="detail-value">
                 <button onclick="resetDb()" class="btn btn-sm" style="background:#7f1d1d;border-color:#dc2626;">
@@ -171,6 +182,16 @@ function resetDb() {
     fetch('/api/reset', { method: 'POST' })
         .then(r => r.json())
         .then(d => { alert(d.message || 'Done'); location.reload(); });
+}
+function reprocessCached() {
+    if (!confirm("Re-run extraction and summary on all cached filings? This may take 5-15 minutes but doesn't re-download from SEC.")) return;
+    fetch('/api/reprocess', { method: 'POST' })
+        .then(r => r.json())
+        .then(d => {
+            if (d.error) { alert(d.error); return; }
+            alert('Reprocessing started. Watch the status bar for progress.');
+            location.reload();
+        });
 }
 </script>
 

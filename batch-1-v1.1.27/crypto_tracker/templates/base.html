@@ -119,10 +119,12 @@
                     const btn = document.getElementById('btn-scrape');
                     btn.disabled = false;
                     btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                    const didWork = /\b[1-9]\d* new\b/.test(status.message || '')
+                        || /Reprocessed \d+/.test(status.message || '');
                     setTimeout(() => {
                         document.getElementById('scraper-bar').style.display = 'none';
-                        location.reload();
-                    }, 3000);
+                        if (didWork) location.reload();
+                    }, 10000);
                 }
             });
     }

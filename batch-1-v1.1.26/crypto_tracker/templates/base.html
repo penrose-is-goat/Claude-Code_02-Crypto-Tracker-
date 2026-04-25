@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Crypto SEC Filing Tracker{% endblock %}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <!-- NAVIGATION -->
+    <nav class="nav-bar">
+        <div class="nav-inner">
+            <a href="/" class="nav-brand">
+                <span class="nav-icon">&#9878;</span>
+                <div>
+                    <div class="nav-title">CRYPTO SEC FILING TRACKER <span style="font-size:9px;color:#6366f1;font-weight:400;">v1.1.26</span></div>
+                    <div class="nav-sub">For Crypto Lawyers | SEC EDGAR | Interactive Dashboard</div>
+                </div>
+            </a>
+            <div class="nav-links">
+                <a href="/" class="nav-link {% if request.path == '/' %}active{% endif %}">Dashboard</a>
+                <a href="/filings" class="nav-link {% if '/filings' in request.path %}active{% endif %}">All Filings</a>
+                <a href="/settings" class="nav-link {% if '/settings' in request.path %}active{% endif %}">Settings</a>
+                <div class="nav-actions">
+                    <button id="btn-scrape" class="btn btn-primary" onclick="startScraper()">
+                        <span id="scrape-icon">&#9881;</span> Update Filings
+                    </button>
+                    <div class="dropdown">
+                        <button class="btn btn-secondary">&#8615; Export</button>
+                        <div class="dropdown-menu">
+                            <a href="/api/export/csv" class="dropdown-item">Download CSV</a>
+                            <a href="/api/export/xlsx" class="dropdown-item">Download Excel</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- SCRAPER STATUS BAR -->
+    <div id="scraper-bar" class="scraper-bar" style="display:none;">
+        <div class="scraper-bar-inner">
+            <span class="scraper-spinner">&#8635;</span>
+            <span id="scraper-msg">Starting scraper...</span>
+            <div class="scraper-progress-wrap">
+                <div id="scraper-progress" class="scraper-progress" style="width:0%"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-inner">
+                <div class="footer-left">
+                    <span>Crypto SEC Filing Tracker</span>
+                    <span class="footer-sep">|</span>
+                    <span>Data: SEC EDGAR (EFTS)</span>
+                    <span class="footer-sep">|</span>
+                    <span>{{ now.strftime('%Y-%m-%d %H:%M') }}</span>
+                </div>
+                <div class="footer-links">
+                    <a href="https://www.sec.gov/digital-assets" target="_blank" class="footer-link">SEC Digital Assets</a>
+                    <a href="https://www.sec.gov/litigation/litreleases.htm" target="_blank" class="footer-link">Litigation</a>
+                    <a href="https://www.sec.gov/news/pressreleases" target="_blank" class="footer-link">Press Releases</a>
+                    <a href="https://www.sec.gov/news/statements" target="_blank" class="footer-link">Statements</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+    // ═══════════════ SCRAPER CONTROL ═══════════════
+    let scraperPolling = null;
+
+    function startScraper() {
+        const btn = document.getElementById('btn-scrape');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spin">&#8635;</span> Running...';
+        document.getElementById('scraper-bar').style.display = 'block';
+        document.getElementById('scraper-msg').textContent = 'Starting scraper...';
+
+        fetch('/api/scrape', { method: 'POST' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                    return;
+                }
+                scraperPolling = setInterval(pollScraperStatus, 2000);
+            })
+            .catch(err => {
+                alert('Failed to start scraper: ' + err);
+                btn.disabled = false;
+                btn.innerHTML = '<span>&#9881;</span> Update Filings';
+            });
+    }
+
+    function pollScraperStatus() {
+        fetch('/api/scraper-status')
+            .then(r => r.json())
+            .then(status => {
+                document.getElementById('scraper-msg').textContent = status.message;
+                if (status.total > 0) {
+                    const pct = Math.round((status.progress / status.total) * 100);
+                    document.getElementById('scraper-progress').style.width = pct + '%';
+                }
+                if (!status.running) {
+                    clearInterval(scraperPolling);
+                    const btn = document.getElementById('btn-scrape');
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                    setTimeout(() => {
+                        document.getElementById('scraper-bar').style.display = 'none';
+                        location.reload();
+                    }, 3000);
+                }
+            });
+    }
+
+    // Check if scraper is already running on page load
+    fetch('/api/scraper-status')
+        .then(r => r.json())
+        .then(status => {
+            if (status.running) {
+                document.getElementById('btn-scrape').disabled = true;
+                document.getElementById('btn-scrape').innerHTML = '<span class="spin">&#8635;</span> Running...';
+                document.getElementById('scraper-bar').style.display = 'block';
+                document.getElementById('scraper-msg').textContent = status.message;
+                scraperPolling = setInterval(pollScraperStatus, 2000);
+            }
+        });
+    </script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,13 +1,8 @@
 """
-Flask web application for Crypto SEC Filing Tracker v1.1.27.
+Flask web application for Crypto SEC Filing Tracker v1.1.28.
 
-New in v1.1.27:
-  - /api/reprocess — re-extract/re-summarize cached filings without re-scraping
-  - /api/filing/<acc>/sections — list all extraction candidates for a filing
-  - /api/filing/<acc>/set-primary/<section_id> — manually override primary
-
-Queries run against v_filings_display view which joins the normalized schema
-back into the flat shape the templates expect.
+v1.1.28: Update Filings auto-reprocesses cached filings when no new ones
+are found, so clicking the button always does useful work.
 """
 import json
 import os
@@ -201,10 +196,16 @@ def api_start_scraper():
         try:
             result = run_scraper(progress_callback=_scraper_progress)
             with _scraper_lock:
-                if result["new_found"] == 0 and result["total_in_db"] > 0:
+                reprocessed = result.get("reprocessed", 0)
+                if reprocessed > 0:
                     _scraper_status["message"] = (
-                        f"No new filings — {result['total_in_db']} already cached. "
-                        f"To re-run extraction with new logic, go to Settings -> Re-Extract All."
+                        f"Done: reprocessed {reprocessed} cached filings, "
+                        f"{result['total_in_db']} with summaries "
+                        f"({result['duration_seconds']/60:.1f}min)"
+                    )
+                elif result["new_found"] == 0 and result["total_in_db"] == 0:
+                    _scraper_status["message"] = (
+                        "No filings found. Check your internet connection and try again."
                     )
                 else:
                     _scraper_status["message"] = (

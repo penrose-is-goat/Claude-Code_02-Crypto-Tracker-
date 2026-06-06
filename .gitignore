@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Local runtime and cache data
+.runtime_cache/
+.runtime_data/
+.cache/
+cache/
+*_cache/
+crypto_tracker/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+*.log
+.env
+*.egg-info/
+dist/
+build/

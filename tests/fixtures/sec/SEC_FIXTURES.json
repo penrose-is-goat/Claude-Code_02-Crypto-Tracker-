@@ -1,0 +1,18 @@
+{
+  "coinbase_2024_10k_excerpt.txt": {
+    "source_url": "https://www.sec.gov/Archives/edgar/data/1679788/000167978825000022/coin-20241231.htm",
+    "form_type": "10-K",
+    "fixture_chars": 397776,
+    "expected_start": 106431,
+    "expected_end": 396275,
+    "expected_hash": "d94375b5e0ab777454226c383c36d261a0e7bfefc07fbbd743927d3f02243270"
+  },
+  "ibit_2024_424b3_excerpt.txt": {
+    "source_url": "https://www.sec.gov/Archives/edgar/data/1980994/000143774924001125/bit20240109_424b3.htm",
+    "form_type": "424B3",
+    "fixture_chars": 319046,
+    "expected_start": 63726,
+    "expected_end": 317546,
+    "expected_hash": "426ba7b10e84d0923e62aad5f468a4a876e20f3013501eb86513572fe495baaf"
+  }
+}

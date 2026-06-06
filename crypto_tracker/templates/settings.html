@@ -83,7 +83,15 @@
         </div>
         <div class="detail-item">
             <div class="detail-label">Max per Keyword</div>
-            <div class="detail-value">{{ config.MAX_PER_KEYWORD }}</div>
+            <div class="detail-value">{{ config.EFTS_PAGE_SIZE }} per EFTS page</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Default Mode</div>
+            <div class="detail-value">{{ config.DEFAULT_SCRAPE_MODE }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Default Scope</div>
+            <div class="detail-value">{{ config.DEFAULT_SCRAPE_SCOPE }}</div>
         </div>
     </div>
     <div style="margin-top:12px;">
@@ -97,7 +105,7 @@
     <div style="margin-top:12px;">
         <div class="detail-label">Form Types</div>
         <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
-            {% for ft in config.FORM_TYPES %}
+            {% for ft in config.RISK_DEFAULT_FORM_TYPES %}
             <span class="badge badge-etf">{{ ft }}</span>
             {% endfor %}
         </div>
@@ -130,7 +138,7 @@
                     Re-Extract All
                 </button>
                 <div style="font-size:9px;color:#64748b;margin-top:2px;">
-                    Re-run extraction + summary on cached filings. No re-download.
+                    Re-run cached exact extraction. Summaries can run separately.
                 </div>
             </div>
         </div>
@@ -215,8 +223,29 @@ function reprocessCached() {
         </div>
         <div class="detail-item">
             <div class="detail-label">Progress</div>
-            <div class="detail-value">{{ scraper_status.saved }} saved / {{ scraper_status.failed }} failed</div>
+            <div class="detail-value">
+                {{ scraper_status.saved }} exact saved /
+                {{ scraper_status.skipped }} skipped /
+                {{ scraper_status.failed }} failed
+            </div>
         </div>
+        {% if scraper_status.metrics and scraper_status.metrics.counters %}
+        <div class="detail-item">
+            <div class="detail-label">Candidate Universe</div>
+            <div class="detail-value">{{ scraper_status.metrics.counters.candidate_universe }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Analysis Deferred</div>
+            <div class="detail-value">{{ scraper_status.metrics.counters.analysis_deferred }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">SEC Requests / 429s</div>
+            <div class="detail-value">
+                {{ scraper_status.metrics.counters.sec_requests }} /
+                {{ scraper_status.metrics.counters.sec_429 }}
+            </div>
+        </div>
+        {% endif %}
     </div>
 </div>
 {% endblock %}

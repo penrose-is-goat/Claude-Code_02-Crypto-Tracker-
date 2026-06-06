@@ -1,5 +1,11 @@
 """
-Configuration for Crypto SEC Filing Tracker v1.1.34.
+Configuration for Crypto SEC Filing Tracker v1.1.35.
+
+v1.1.35 changes:
+- Faster direct SEC submissions discovery for known CIKs
+- Exact risk-section extraction with source hashes/offset provenance
+- Version-aware text-cleaning cache so extractor fixes are not hidden by
+  stale cleaned HTML from older releases
 
 v1.1.34 changes:
 - Per-filing contextual metadata (Type/Purpose/Holdings now derived from
@@ -18,21 +24,28 @@ import os
 from datetime import datetime
 
 # ─── Version ──────────────────────────────────────────────────────────────
-VERSION = "1.1.34"
-VERSION_NAME = "Batch 1 — SEC Filing Tracker (contextual per-filing metadata)"
+VERSION = "1.1.35"
+VERSION_NAME = "Batch 1 — SEC Filing Tracker (fast exact risk extraction)"
 
 # ─── Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Shared DB lives OUTSIDE the version directory so v1.1.30 inherits
 # v1.1.29's 700 filings instantly without re-processing.
-_SHARED_DATA = os.path.join(os.path.expanduser("~"), ".crypto_tracker_data")
+_SHARED_DATA = os.environ.get(
+    "CRYPTO_TRACKER_DATA_DIR",
+    os.path.join(os.path.expanduser("~"), ".crypto_tracker_data"),
+)
 DATA_DIR = _SHARED_DATA
 DB_PATH = os.path.join(_SHARED_DATA, "crypto_filings.db")
 EXPORT_DIR = os.path.join(_SHARED_DATA, "exports")
 
 # Cache goes to ~/.crypto_tracker_cache (short path, avoids Windows MAX_PATH)
-EDGAR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".crypto_tracker_cache")
+EDGAR_CACHE_DIR = os.environ.get(
+    "CRYPTO_TRACKER_CACHE_DIR",
+    os.path.join(os.path.expanduser("~"), ".crypto_tracker_cache"),
+)
+RAW_DOC_CACHE_DIR = os.path.join(EDGAR_CACHE_DIR, "sec_archive_docs")
 
 # ─── SEC EDGAR Identity (required by SEC fair-access policy) ─────────────
 SEC_IDENTITY = "PenroseHayek crypto.hedger23@gmail.com"
@@ -49,22 +62,42 @@ USE_EDGAR_LOCAL_CACHE = True
 # ─── Scraping Parameters ─────────────────────────────────────────────────
 START_DATE = "2019-01-01"
 END_DATE = datetime.now().strftime("%Y-%m-%d")
-IO_THREADS = 8              # Network fetch concurrency (SEC fair-access: 10/s max)
+IO_THREADS = 12             # Network/extraction concurrency; SEC HTTP is paced below
 CPU_WORKERS = 2             # BS4/extraction concurrency (GIL-bound — more threads = slower)
 MAX_PER_KEYWORD = 25        # Max filings per keyword per form type
 HTTP_TIMEOUT = 30
 REQUEST_DELAY = 0.10
 FILING_TIMEOUT = 120        # Per-filing timeout in seconds
+DB_BATCH_SIZE = 100         # Commit filing/skip writes in bounded batches
+
+# ─── SEC fair-access pacing ──────────────────────────────────────────────
+# SEC allows up to 10 requests/sec, but bursts from parallel workers were
+# causing 429s and then silently dropping filings. Pace all SEC HTTP calls
+# through one gate and retry 429s with a cooldown.
+SEC_TARGET_REQUESTS_PER_SECOND = 8.0
+SEC_REQUEST_MIN_INTERVAL = 1.0 / SEC_TARGET_REQUESTS_PER_SECOND
+SEC_REQUEST_MAX_INTERVAL = 1.0
+SEC_MAX_RETRIES = 4
+SEC_BACKOFF_BASE = 2.0
+SEC_BACKOFF_MAX = 60.0
+SEC_429_COOLDOWN = 10.0
 
 # ─── EFTS direct-HTTP search (bypasses edgartools' PoolTimeout) ──────────
 EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 EFTS_TIMEOUT = 15           # Per-search timeout, much shorter than 60s default
 EFTS_RETRIES = 1            # Try once, retry once; bail fast on failure
 EFTS_MAX_CONSECUTIVE_FAILURES = 3  # Abort EFTS phase after N straight failures
+EFTS_PAGE_SIZE = 100
+EFTS_MAX_PAGES_PER_QUERY = 1  # Complete first page per query; fixed-point tested
 
 # ─── EFTS response cache (v1.1.33: skip re-querying same searches) ───────
 EFTS_CACHE_DIR = os.path.join(_SHARED_DATA, "efts_cache")
 EFTS_CACHE_TTL = 3600       # 1 hour — fresh enough for "click Update again"
+
+# ─── SEC submissions JSON cache (one pull per known CIK) ────────────────
+SUBMISSIONS_CACHE_TTL = 21600     # 6 hours: repeated Update clicks should not re-pull every CIK
+SUBMISSIONS_TIMEOUT = 15
+SEC_TICKER_MAP_CACHE_TTL = 604800  # 7 days: catches stale hardcoded ticker/CIK pairs
 
 # ─── Parallel CIK search (v1.1.33: was sequential, 30 cos × 5 forms) ─────
 CIK_SEARCH_THREADS = 6      # Sub-IO_THREADS to leave room for processing
@@ -72,6 +105,11 @@ CIK_SEARCH_THREADS = 6      # Sub-IO_THREADS to leave room for processing
 # ─── Text-cleaning cache ────────────────────────────────────────────────
 # sha256(raw_html) → cleaned text. Skips BS4 entirely on reprocessing.
 TEXT_CACHE_DIR = os.path.join(_SHARED_DATA, "text_cache")
+TEXT_CACHE_VERSION = "htmlclean-v3-fast-large-html"
+FAST_HTML_CLEAN_BYTES = 750_000
+
+# Bump when discovery/extraction skip decisions need to be re-audited.
+PROCESSOR_VERSION = f"{VERSION}-{TEXT_CACHE_VERSION}-skipstate-v2-cik-validated"
 
 # ─── Search Keywords ─────────────────────────────────────────────────────
 KEYWORDS = [
@@ -91,44 +129,40 @@ KEYWORDS = [
 CRYPTO_COMPANIES = {
     # Exchanges & brokers
     "1679788": ("Coinbase Global Inc",          "COIN",  "exchange"),
-    "1828318": ("Bakkt Holdings Inc",           "BKKT",  "exchange"),
-    "1722438": ("Galaxy Digital Holdings",      "GLXY",  "broker"),
+    "1820302": ("Bakkt Holdings Inc",           "BKKT",  "exchange"),
+    "1859392": ("Galaxy Digital Holdings",      "GLXY",  "broker"),
     "1783879": ("Robinhood Markets Inc",        "HOOD",  "broker"),
-    "1604778": ("Voyager Digital Ltd",          "VYGVQ", "broker"),
 
     # Miners
     "1507605": ("Marathon Digital Holdings",    "MARA",  "miner"),
     "1167419": ("Riot Platforms Inc",           "RIOT",  "miner"),
-    "1854963": ("CleanSpark Inc",               "CLSK",  "miner"),
-    "1591956": ("Hut 8 Mining Corp",            "HUT",   "miner"),
-    "1838359": ("Bitfarms Ltd",                 "BITF",  "miner"),
-    "1845815": ("TeraWulf Inc",                 "WULF",  "miner"),
-    "1907982": ("Iris Energy Ltd",              "IREN",  "miner"),
-    "1825570": ("Cipher Mining Inc",            "CIFR",  "miner"),
-    "1768259": ("Hive Digital Technologies",    "HIVE",  "miner"),
+    "827876":  ("CleanSpark Inc",               "CLSK",  "miner"),
+    "1964789": ("Hut 8 Corp",                   "HUT",   "miner"),
+    "1083301": ("TeraWulf Inc",                 "WULF",  "miner"),
+    "1878848": ("Iris Energy Ltd",              "IREN",  "miner"),
+    "1819989": ("Cipher Digital Inc",           "CIFR",  "miner"),
+    "1720424": ("HIVE Digital Technologies",    "HIVE",  "miner"),
     "1610520": ("Canaan Inc",                   "CAN",   "miner"),
-    "1576580": ("Ebang International Holdings", "EBON",  "miner"),
-    "1709164": ("Greenidge Generation Holdings","GREE",  "miner"),
-    "1819395": ("Stronghold Digital Mining",    "SDIG",  "miner"),
-    "1744494": ("Argo Blockchain plc",          "ARBK",  "miner"),
-    "1761312": ("Bit Digital Inc",              "BTBT",  "miner"),
-    "1859285": ("Core Scientific Inc",          "CORZ",  "miner"),
-    "1873722": ("Soluna Holdings Inc",          "SLNH",  "miner"),
-    "1861974": ("Applied Digital Corporation",  "APLD",  "miner"),
+    "1799290": ("Ebang International Holdings", "EBON",  "miner"),
+    "1844971": ("Greenidge Generation Holdings","GREE",  "miner"),
+    "1841675": ("Argo Blockchain plc",          "ARBK",  "miner"),
+    "1710350": ("Bit Digital Inc",              "BTBT",  "miner"),
+    "1839341": ("Core Scientific Inc",          "CORZ",  "miner"),
+    "64463":   ("Soluna Holdings Inc",          "SLNH",  "miner"),
+    "1144879": ("Applied Digital Corporation",  "APLD",  "miner"),
+    "1591956": ("Sphere 3D Corp",               "ANY",   "miner"),
 
     # Treasury holders
     "1050446": ("MicroStrategy Inc",            "MSTR",  "treasury"),
     "1318605": ("Tesla Inc",                    "TSLA",  "treasury"),
-    "1665300": ("BTCS Inc",                     "BTCS",  "treasury"),
+    "1436229": ("BTCS Inc",                     "BTCS",  "treasury"),
 
     # Payments / fintech with crypto exposure
-    "1512673": ("Block Inc",                    "SQ",    "payments"),
+    "1512673": ("Block Inc",                    "XYZ",   "payments"),
     "1633917": ("PayPal Holdings Inc",          "PYPL",  "payments"),
-    "1716583": ("Mogo Inc",                     "MOGO",  "payments"),
 
     # Other (banking partners, e-commerce, etc.)
-    "1718512": ("Silvergate Capital Corp",      "SI",    "other"),
-    "1411690": ("Overstock.com Inc",            "OSTK",  "other"),
+    "1312109": ("Silvergate Capital Corp",      "",      "other"),
 
     # ─── Spot Bitcoin ETF issuers (v1.1.33 additions) ────────────────────
     "1980994": ("iShares Bitcoin Trust",          "IBIT",  "etf_issuer"),
@@ -155,7 +189,6 @@ CRYPTO_COMPANIES = {
     # ─── Treasury / payments / mining (v1.1.33 additions) ────────────────
     "1876042": ("Circle Internet Group",          "CRCL",  "payments"),
     "1829311": ("BitMine Immersion Technologies", "BMNR",  "treasury"),
-    "1690080": ("ETHZilla Corp",                  "ETHZ",  "treasury"),
     "1846839": ("SOL Strategies Inc",             "STKE",  "treasury"),
     "1899123": ("Bitdeer Technologies Group",     "BTDR",  "miner"),
 }
@@ -165,36 +198,32 @@ CRYPTO_COMPANIES = {
 # Format: CIK -> (purpose, top_holdings)
 COMPANY_DETAILS = {
     "1679788": ("Cryptocurrency exchange and financial services", "BTC, ETH, USDT, SOL, DOGE"),
-    "1828318": ("Digital asset marketplace and custody platform", "BTC, ETH"),
-    "1722438": ("Digital asset financial services and investment management", "BTC, ETH, SOL"),
+    "1820302": ("Digital asset marketplace and custody platform", "BTC, ETH"),
+    "1859392": ("Digital asset financial services and investment management", "BTC, ETH, SOL"),
     "1783879": ("Commission-free trading platform with crypto trading", "BTC, ETH, DOGE"),
-    "1604778": ("Cryptocurrency brokerage and lending platform", "BTC, ETH, USDC"),
     "1507605": ("Bitcoin mining and digital asset operations", "BTC"),
     "1167419": ("Bitcoin mining and data center hosting", "BTC"),
-    "1854963": ("Bitcoin mining using low-carbon energy", "BTC"),
-    "1591956": ("Bitcoin mining and high-performance computing", "BTC"),
-    "1838359": ("Bitcoin mining across multiple global facilities", "BTC"),
-    "1845815": ("Bitcoin mining powered by nuclear energy", "BTC"),
-    "1907982": ("Bitcoin mining powered by renewable energy", "BTC"),
-    "1825570": ("Bitcoin mining and data center development", "BTC"),
-    "1768259": ("Bitcoin mining and HPC infrastructure", "BTC"),
+    "827876":  ("Bitcoin mining using low-carbon energy", "BTC"),
+    "1964789": ("Bitcoin mining and high-performance computing", "BTC"),
+    "1083301": ("Bitcoin mining powered by nuclear energy", "BTC"),
+    "1878848": ("Bitcoin mining powered by renewable energy", "BTC"),
+    "1819989": ("Bitcoin mining and data center development", "BTC"),
+    "1720424": ("Bitcoin mining and HPC infrastructure", "BTC"),
     "1610520": ("Design and manufacture of Bitcoin mining ASICs", "BTC"),
-    "1576580": ("Bitcoin mining hardware manufacturer", "BTC"),
-    "1709164": ("Bitcoin mining and power generation", "BTC"),
-    "1819395": ("Bitcoin mining using waste coal energy", "BTC"),
-    "1744494": ("Bitcoin mining and data center operations", "BTC"),
-    "1761312": ("Bitcoin mining and digital asset staking", "BTC, ETH"),
-    "1859285": ("Bitcoin mining and AI/HPC data center operations", "BTC"),
-    "1873722": ("Green data center hosting and Bitcoin mining", "BTC"),
-    "1861974": ("High-performance computing and Bitcoin mining hosting", "BTC"),
+    "1799290": ("Bitcoin mining hardware manufacturer", "BTC"),
+    "1844971": ("Bitcoin mining and power generation", "BTC"),
+    "1841675": ("Bitcoin mining and data center operations", "BTC"),
+    "1710350": ("Bitcoin mining and digital asset staking", "BTC, ETH"),
+    "1839341": ("Bitcoin mining and AI/HPC data center operations", "BTC"),
+    "64463":   ("Green data center hosting and Bitcoin mining", "BTC"),
+    "1144879": ("High-performance computing and Bitcoin mining hosting", "BTC"),
+    "1591956": ("Bitcoin mining and blockchain infrastructure", "BTC"),
     "1050446": ("Enterprise analytics; Bitcoin treasury reserve strategy", "BTC"),
     "1318605": ("Electric vehicle manufacturer with Bitcoin treasury", "BTC"),
-    "1665300": ("Blockchain technology and digital asset treasury", "BTC, ETH"),
+    "1436229": ("Blockchain technology and digital asset treasury", "BTC, ETH"),
     "1512673": ("Financial services and payments with Bitcoin", "BTC"),
     "1633917": ("Digital payments with crypto buying, selling, holding", "BTC, ETH, LTC, BCH"),
-    "1716583": ("Digital financial services with Bitcoin rewards", "BTC"),
-    "1718512": ("Digital currency banking infrastructure (wound down)", "BTC, ETH"),
-    "1411690": ("E-commerce with blockchain investment (tZERO)", "BTC"),
+    "1312109": ("Digital currency banking infrastructure (wound down)", "BTC, ETH"),
 
     # ─── Spot Bitcoin ETFs (v1.1.33) ─────────────────────────────────────
     "1980994": ("Spot Bitcoin ETF issued by BlackRock iShares",          "BTC"),
@@ -221,7 +250,6 @@ COMPANY_DETAILS = {
     # ─── Treasury / payments / mining (v1.1.33) ──────────────────────────
     "1876042": ("Issuer of USDC stablecoin and crypto payments platform","USDC"),
     "1829311": ("Public company with Ethereum treasury strategy",        "ETH"),
-    "1690080": ("Public company with Ethereum treasury (ex-180 Life)",   "ETH"),
     "1846839": ("Solana validator and treasury company",                 "SOL"),
     "1899123": ("Bitcoin mining and AI cloud infrastructure",            "BTC"),
 }
@@ -234,6 +262,33 @@ COMPANY_FILINGS_PER_FORM = 20
 
 # ─── SEC Form Types to Search ────────────────────────────────────────────
 FORM_TYPES = ["S-1", "S-1/A", "N-1A", "485APOS", "485BPOS", "10-K", "10-Q", "8-K", "D"]
+
+# Default optimized update scope for v1.1.35: risk-bearing forms only.
+# Form D is low-yield for exact risk sections; 8-K is opt-in via event_risk/all.
+RISK_DEFAULT_FORM_TYPES = ["S-1", "S-1/A", "N-1A", "485APOS", "485BPOS", "10-K", "10-Q"]
+CORE_FORM_TYPES = ["10-K", "10-Q", "N-1A", "485APOS", "485BPOS", "S-1", "S-1/A"]
+EVENT_RISK_FORM_TYPES = RISK_DEFAULT_FORM_TYPES + ["8-K"]
+ALL_FORM_TYPES = FORM_TYPES
+
+# EFTS is high-yield for fund/prospectus/offering forms. For 10-K/10-Q, the
+# default run uses known-CIK submissions instead to avoid thousands of broad,
+# low-confidence keyword hits that cannot finish under the hour target.
+# EFTS is high-yield for fund/prospectus/offering forms. 10-K/10-Q broad
+# keyword search remains covered by known-CIK submissions in the default run.
+RISK_DEFAULT_EFTS_FORM_TYPES = ["S-1", "S-1/A", "N-1A", "485APOS", "485BPOS"]
+CORE_EFTS_FORM_TYPES = ["N-1A", "485APOS", "485BPOS", "S-1", "S-1/A"]
+EVENT_RISK_EFTS_FORM_TYPES = RISK_DEFAULT_EFTS_FORM_TYPES + ["8-K"]
+ALL_EFTS_FORM_TYPES = FORM_TYPES
+
+RISK_DEFAULT_COMPANY_FORM_TYPES = ["10-K", "10-Q", "S-1", "S-1/A"]
+CORE_COMPANY_FORM_TYPES = ["10-K", "10-Q"]
+EVENT_RISK_COMPANY_FORM_TYPES = RISK_DEFAULT_COMPANY_FORM_TYPES + ["8-K"]
+ALL_COMPANY_FORM_TYPES = COMPANY_FORM_TYPES
+
+SCRAPE_MODES = {"exact_only", "analysis_only", "low_confidence_only", "all_cached"}
+SCRAPE_SCOPES = {"risk_default", "core", "event_risk", "all"}
+DEFAULT_SCRAPE_MODE = "exact_only"
+DEFAULT_SCRAPE_SCOPE = "risk_default"
 
 # Forms that represent ETF/Fund offerings (Tier 1)
 ETF_FUND_FORMS = {"485APOS", "485BPOS", "N-1A", "S-1", "D"}

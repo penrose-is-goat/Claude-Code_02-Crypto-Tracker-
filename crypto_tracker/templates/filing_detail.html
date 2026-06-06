@@ -47,6 +47,28 @@
             <div class="detail-value">{{ filing.extraction_method or 'N/A' }}</div>
         </div>
         <div class="detail-item">
+            <div class="detail-label">Source Document</div>
+            <div class="detail-value">
+                {% if filing.source_doc_url %}
+                    <a href="{{ filing.source_doc_url }}" target="_blank" class="link">{{ filing.source_doc_name or 'Source document' }}</a>
+                {% else %}
+                    {{ filing.source_doc_name or 'N/A' }}
+                {% endif %}
+            </div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Exact Text Hash</div>
+            <div class="detail-value mono">{{ filing.exact_text_hash[:12] if filing.exact_text_hash else 'N/A' }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Source Offsets</div>
+            <div class="detail-value">
+                {% if filing.start_offset is not none and filing.end_offset is not none %}
+                    {{ '{:,}'.format(filing.start_offset) }}-{{ '{:,}'.format(filing.end_offset) }}
+                {% else %}N/A{% endif %}
+            </div>
+        </div>
+        <div class="detail-item">
             <div class="detail-label">Extraction Confidence</div>
             <div class="detail-value">
                 {% if filing.extraction_confidence %}
@@ -100,7 +122,13 @@
 <!-- Risk Summary -->
 <div class="card" style="margin-bottom:12px;">
     <div class="risk-summary-label">RISK FACTOR SUMMARY</div>
-    <div class="risk-summary-box">{{ filing.risk_summary }}</div>
+    <div class="risk-summary-box">
+        {% if filing.risk_summary %}
+            {{ filing.risk_summary }}
+        {% else %}
+            Analysis pending. The exact source-backed risk section is already saved below.
+        {% endif %}
+    </div>
 </div>
 
 <!-- Extraction Candidates (v1.1.27) -->
@@ -155,9 +183,82 @@ function setPrimary(acc, sectionId) {
 
 <!-- Full Risk Section -->
 <div class="card">
-    <div class="card-title">FULL RISK SECTION</div>
-    <div class="risk-content" style="display:block;margin-top:8px;">
-        {{ filing.risk_html | safe }}
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
+        <div class="card-title">
+            EXACT RISK SECTION
+            <span style="color:#64748b;font-weight:400;margin-left:6px;">
+                ({{ '{:,}'.format(filing.risk_char_count) }} chars)
+            </span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="exact-risk-toggle" class="btn btn-sm" onclick="loadExactRisk(true)">Show Text</button>
+            <button class="btn btn-sm" onclick="copyExactRisk()">Copy Text</button>
+            <a href="/api/filing/{{ filing.accession_no }}/exact-risk.txt" class="btn btn-sm">Download TXT</a>
+        </div>
+    </div>
+    <div id="exact-risk-text"
+         class="risk-content"
+         data-url="/api/filing/{{ filing.accession_no }}/exact-risk.txt"
+         data-loaded="0"
+         style="display:block;margin-top:8px;">
+        <div style="color:#64748b;">
+            Exact text is stored with source provenance. Use Show Text, Copy Text, or Download TXT to inspect it.
+        </div>
     </div>
 </div>
+<script>
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function loadExactRisk(showAfterLoad) {
+    const el = document.getElementById('exact-risk-text');
+    const btn = document.getElementById('exact-risk-toggle');
+    if (el.dataset.loaded === '1') {
+        if (showAfterLoad !== false) {
+            el.style.display = 'block';
+            btn.textContent = 'Hide Text';
+        }
+        return Promise.resolve(el.dataset.rawText || el.innerText);
+    }
+    el.style.display = 'block';
+    el.innerHTML = '<div style="color:#64748b;">Loading exact text...</div>';
+    return fetch(el.dataset.url)
+        .then(r => {
+            if (!r.ok) throw new Error('Could not load exact text');
+            return r.text();
+        })
+        .then(text => {
+            el.dataset.loaded = '1';
+            el.dataset.rawText = text;
+            btn.textContent = 'Hide Text';
+            el.innerHTML = '<pre style="white-space:pre-wrap;margin:0;font:inherit;">'
+                + escapeHtml(text) + '</pre>';
+            return text;
+        })
+        .catch(() => {
+            el.innerHTML = '<div style="color:#fca5a5;">Could not load exact text.</div>';
+            return '';
+        });
+}
+
+document.getElementById('exact-risk-toggle').addEventListener('click', function() {
+    const el = document.getElementById('exact-risk-text');
+    if (el.dataset.loaded === '1' && el.style.display !== 'none') {
+        el.style.display = 'none';
+        this.textContent = 'Show Text';
+    }
+});
+
+function copyExactRisk() {
+    loadExactRisk(false).then(text => {
+        if (text) navigator.clipboard.writeText(text);
+    });
+}
+</script>
 {% endblock %}

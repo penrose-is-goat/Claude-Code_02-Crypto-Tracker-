@@ -5,7 +5,7 @@
 <!-- STAT CARDS -->
 <div class="stat-grid">
     <div class="card stat-card" style="border-top-color:#a5b4fc;">
-        <div class="stat-label">TOTAL FILINGS</div>
+        <div class="stat-label">EXACT SECTIONS</div>
         <div class="stat-value" style="color:#a5b4fc;">{{ stats.total }}</div>
     </div>
     <div class="card stat-card" style="border-top-color:#86efac;">
@@ -20,6 +20,14 @@
         <div class="stat-label">OPERATING CO.</div>
         <div class="stat-value" style="color:#fcd34d;">{{ stats.oper_count }}</div>
     </div>
+    <div class="card stat-card" style="border-top-color:#67e8f9;">
+        <div class="stat-label">ANALYZED</div>
+        <div class="stat-value" style="color:#67e8f9;">{{ stats.analysis_complete }}</div>
+    </div>
+    <div class="card stat-card" style="border-top-color:#fca5a5;">
+        <div class="stat-label">ANALYSIS PENDING</div>
+        <div class="stat-value" style="color:#fca5a5;">{{ stats.analysis_pending }}</div>
+    </div>
 </div>
 
 <!-- FILTER BAR (shown when a chart element is clicked) -->
@@ -31,33 +39,41 @@
 
 <!-- CHARTS ROW 1 -->
 <div class="chart-grid">
-    <div class="card">
+    <div class="card chart-card">
         <div class="card-title">
             MONTHLY FILINGS <span class="card-hint">(click a bar to filter)</span>
         </div>
-        <canvas id="chart-monthly" height="160"></canvas>
-    </div>
-    <div class="card">
-        <div class="card-title">
-            ETF vs OPERATING CO. <span class="card-hint">(click to filter)</span>
+        <div class="chart-frame chart-frame--short">
+            <canvas id="chart-monthly" aria-label="Monthly filings bar chart"></canvas>
         </div>
-        <canvas id="chart-category" height="160"></canvas>
+    </div>
+    <div class="card chart-card">
+        <div class="card-title">
+            CATEGORY MIX <span class="card-hint">(click a bar to filter)</span>
+        </div>
+        <div class="chart-frame chart-frame--short">
+            <canvas id="chart-category" aria-label="Filing category comparison bar chart"></canvas>
+        </div>
     </div>
 </div>
 
 <!-- CHARTS ROW 2 -->
 <div class="chart-grid">
-    <div class="card">
+    <div class="card chart-card">
         <div class="card-title">
             TOP COMPANIES <span class="card-hint">(click to filter)</span>
         </div>
-        <canvas id="chart-companies" height="220"></canvas>
+        <div class="chart-frame chart-frame--tall">
+            <canvas id="chart-companies" aria-label="Top companies horizontal bar chart"></canvas>
+        </div>
     </div>
-    <div class="card">
+    <div class="card chart-card">
         <div class="card-title">
             SEARCH KEYWORDS <span class="card-hint">(click to filter)</span>
         </div>
-        <canvas id="chart-keywords" height="220"></canvas>
+        <div class="chart-frame chart-frame--tall">
+            <canvas id="chart-keywords" aria-label="Search keyword bar chart"></canvas>
+        </div>
     </div>
 </div>
 
@@ -98,6 +114,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <div class="card-title" id="table-label">ALL FILINGS ({{ stats.total }})</div>
         <input id="search-box" class="search-input" placeholder="Search filings..."
+               aria-label="Search filings in the dashboard table"
                oninput="textFilter()">
     </div>
     <div class="table-scroll">
@@ -148,6 +165,7 @@ function applyFilter(type, value, label) {
     activeFilterValue = value;
     document.getElementById('filter-bar').style.display = 'flex';
     document.getElementById('filter-text').textContent = label;
+    setUrlFilter(type, value);
     loadFilings();
 }
 
@@ -156,7 +174,35 @@ function clearFilter() {
     activeFilterValue = null;
     document.getElementById('filter-bar').style.display = 'none';
     document.getElementById('search-box').value = '';
+    history.replaceState(null, '', window.location.pathname);
     loadFilings();
+}
+
+function setUrlFilter(type, value) {
+    const params = new URLSearchParams();
+    params.set(type, value);
+    history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`);
+}
+
+function hydrateFilterFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const candidates = [
+        ['month', 'Month'],
+        ['category', 'Category'],
+        ['company', 'Company'],
+        ['keyword', 'Keyword'],
+        ['form_type', 'Form']
+    ];
+    for (const [key, label] of candidates) {
+        const value = params.get(key);
+        if (value) {
+            activeFilterType = key;
+            activeFilterValue = value;
+            document.getElementById('filter-bar').style.display = 'flex';
+            document.getElementById('filter-text').textContent = `${label}: ${value}`;
+            break;
+        }
+    }
 }
 
 function textFilter() {
@@ -195,7 +241,7 @@ function loadFilings() {
 
             tbody.innerHTML = filings.map(f => {
                 const formClass = getBadgeClass(f.form_type);
-                const summary = f.risk_summary || '';
+                const summary = f.risk_summary || 'Analysis pending. Exact risk section is saved.';
                 const shortSummary = summary.length > 140
                     ? escHtml(summary.slice(0, 140)) + '...'
                     : escHtml(summary);
@@ -239,6 +285,32 @@ function getBadgeClass(formType) {
 // ═══════════════ CHART SETUP ═══════════════
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#1e293b';
+Chart.defaults.font.family = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
+const valueLabelPlugin = {
+    id: 'valueLabelPlugin',
+    afterDatasetsDraw(chart) {
+        if (!['bar'].includes(chart.config.type)) return;
+        const { ctx } = chart;
+        ctx.save();
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = '600 10px JetBrains Mono, monospace';
+        ctx.textBaseline = 'middle';
+        chart.data.datasets.forEach((dataset, datasetIndex) => {
+            const meta = chart.getDatasetMeta(datasetIndex);
+            meta.data.forEach((bar, index) => {
+                const value = dataset.data[index];
+                if (value === null || value === undefined) return;
+                const horizontal = chart.options.indexAxis === 'y';
+                ctx.textAlign = horizontal ? 'left' : 'center';
+                const x = horizontal ? bar.x + 6 : bar.x;
+                const y = horizontal ? bar.y : bar.y - 8;
+                ctx.fillText(value, x, y);
+            });
+        });
+        ctx.restore();
+    }
+};
 
 // Monthly filings bar chart
 new Chart(document.getElementById('chart-monthly'), {
@@ -256,8 +328,13 @@ new Chart(document.getElementById('chart-monthly'), {
     },
     options: {
         responsive: true,
-        plugins: { legend: { display: false } },
-        scales: { x: { ticks: { font: { size: 7 }, maxRotation: 45 } } },
+        maintainAspectRatio: false,
+        layout: { padding: { top: 18 } },
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+            x: { ticks: { font: { size: 10 }, maxRotation: 45 } },
+            y: { beginAtZero: true, ticks: { precision: 0 } }
+        },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
                 const idx = elements[0].index;
@@ -265,24 +342,34 @@ new Chart(document.getElementById('chart-monthly'), {
                 applyFilter('month', month, 'Month: ' + month);
             }
         }
-    }
+    },
+    plugins: [valueLabelPlugin]
 });
 
-// Category doughnut
+// Category comparison
 new Chart(document.getElementById('chart-category'), {
-    type: 'doughnut',
+    type: 'bar',
     data: {
         labels: catLabels,
         datasets: [{
             data: catValues,
-            backgroundColor: ['#ec4899', '#f59e0b', '#64748b'],
-            hoverBackgroundColor: ['#f472b6', '#fbbf24', '#94a3b8'],
-            borderWidth: 0
+            backgroundColor: ['#ec489960', '#f59e0b60', '#64748b60'],
+            hoverBackgroundColor: ['#ec4899', '#f59e0b', '#64748b'],
+            borderColor: ['#ec4899', '#f59e0b', '#64748b'],
+            borderWidth: 1,
+            borderRadius: 3
         }]
     },
     options: {
         responsive: true,
-        plugins: { legend: { position: 'bottom' } },
+        maintainAspectRatio: false,
+        indexAxis: 'y',
+        layout: { padding: { right: 28 } },
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+            x: { beginAtZero: true, ticks: { precision: 0 } },
+            y: { ticks: { font: { size: 11 } } }
+        },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
                 const idx = elements[0].index;
@@ -290,7 +377,8 @@ new Chart(document.getElementById('chart-category'), {
                 applyFilter('category', cat, 'Category: ' + cat);
             }
         }
-    }
+    },
+    plugins: [valueLabelPlugin]
 });
 
 // Top companies horizontal bar
@@ -309,9 +397,14 @@ new Chart(document.getElementById('chart-companies'), {
     },
     options: {
         responsive: true,
+        maintainAspectRatio: false,
         indexAxis: 'y',
-        plugins: { legend: { display: false } },
-        scales: { y: { ticks: { font: { size: 7 } } } },
+        layout: { padding: { right: 28 } },
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+            x: { beginAtZero: true, ticks: { precision: 0 } },
+            y: { ticks: { font: { size: 10 } } }
+        },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
                 const idx = elements[0].index;
@@ -319,7 +412,8 @@ new Chart(document.getElementById('chart-companies'), {
                 applyFilter('company', company, 'Company: ' + company);
             }
         }
-    }
+    },
+    plugins: [valueLabelPlugin]
 });
 
 // Keywords bar chart
@@ -343,8 +437,13 @@ new Chart(document.getElementById('chart-keywords'), {
     },
     options: {
         responsive: true,
-        plugins: { legend: { display: false } },
-        scales: { x: { ticks: { font: { size: 8 }, maxRotation: 45 } } },
+        maintainAspectRatio: false,
+        layout: { padding: { top: 18 } },
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+            x: { ticks: { font: { size: 10 }, maxRotation: 45 } },
+            y: { beginAtZero: true, ticks: { precision: 0 } }
+        },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
                 const idx = elements[0].index;
@@ -352,10 +451,12 @@ new Chart(document.getElementById('chart-keywords'), {
                 applyFilter('keyword', kw, 'Keyword: ' + kw);
             }
         }
-    }
+    },
+    plugins: [valueLabelPlugin]
 });
 
 // Load initial filing table
+hydrateFilterFromUrl();
 loadFilings();
 </script>
 {% endblock %}

@@ -7,8 +7,9 @@
     <div>
         <h1 class="page-title">ALL FILINGS</h1>
         <p class="page-subtitle">
-            {{ filings | length }} filings | Filterable by date, company, type |
-            AI summaries + full risk section dropdowns
+            Showing {{ page_offset + 1 if filings else 0 }}-{{ page_offset + filings | length }} |
+            Filterable by date, company, type |
+            Exact risk sections saved first; analysis may be pending
         </p>
     </div>
     <div class="filing-header-right">
@@ -86,7 +87,7 @@
                 <span class="filing-meta">
                     {{ f.filing_date[:10] if f.filing_date else 'N/A' }}
                     &middot; {{ f.filing_category }}
-                    &middot; {{ '{:,}'.format(f.text_length) }}ch
+                    &middot; exact {{ '{:,}'.format(f.text_length) }}ch
                     {% if f.extraction_confidence %}
                     &middot;
                     {% if f.extraction_confidence >= 0.7 %}
@@ -133,20 +134,33 @@
         </div>
 
         <!-- Risk Summary -->
-        <div class="risk-summary-label">RISK FACTOR SUMMARY</div>
+        <div class="risk-summary-label">ANALYSIS STATUS</div>
         <div class="risk-summary-box">
+            {% if f.risk_summary %}
             {{ f.risk_summary }}
+            {% else %}
+            Analysis pending. The exact source-backed risk section is already saved below.
+            {% endif %}
         </div>
 
         <!-- Risk Section Dropdown -->
         {% if f.risk_section and f.risk_section | length > 40 %}
         <div class="risk-dropdown">
             <button class="btn-risk-toggle" onclick="toggleRisk({{ loop.index }})">
-                <span id="arrow-{{ loop.index }}">&#9654;</span> Show Full Risk Section
+                <span id="arrow-{{ loop.index }}">&#9654;</span> Show Exact Risk Section
                 <span style="color:#64748b;font-weight:400;margin-left:4px;">({{ '{:,}'.format(f.risk_section | length) }} chars)</span>
             </button>
-            <div id="risk-{{ loop.index }}" class="risk-content" style="display:none;">
-                {{ f.risk_html | safe }}
+            <a class="btn btn-sm" href="/api/filing/{{ f.accession_no }}/exact-risk.txt"
+               title="Download exact source-backed risk text">Exact TXT</a>
+            {% if f.source_doc_url %}
+            <a class="btn btn-sm" href="{{ f.source_doc_url }}" target="_blank"
+               title="Open the exact source document used for extraction">Source</a>
+            {% endif %}
+            <div id="risk-{{ loop.index }}" class="risk-content"
+                 data-url="/api/filing/{{ f.accession_no }}/exact-risk.txt"
+                 data-loaded="0"
+                 style="display:none;">
+                <div style="color:#64748b;">Loading exact text...</div>
             </div>
         </div>
         {% endif %}
@@ -172,7 +186,18 @@
 <!-- PAGINATION INFO -->
 {% if filings %}
 <div class="pagination-info">
-    Showing {{ filings | length }} filing{{ 's' if filings | length != 1 else '' }}
+    <span>
+        Showing {{ page_offset + 1 }}-{{ page_offset + filings | length }}
+        filing{{ 's' if filings | length != 1 else '' }}
+    </span>
+    <span style="display:inline-flex;gap:8px;margin-left:12px;">
+        {% if prev_url %}
+        <a href="{{ prev_url }}" class="btn btn-sm">Previous</a>
+        {% endif %}
+        {% if next_url %}
+        <a href="{{ next_url }}" class="btn btn-sm">Next</a>
+        {% endif %}
+    </span>
 </div>
 {% endif %}
 {% endblock %}
@@ -187,11 +212,32 @@ function toggleRisk(idx) {
         el.style.display = 'block';
         arrow.innerHTML = '&#9660;';
         btn.childNodes[1].textContent = ' Hide Risk Section';
+        if (el.dataset.loaded !== '1') {
+            fetch(el.dataset.url)
+                .then(r => r.text())
+                .then(text => {
+                    el.dataset.loaded = '1';
+                    el.innerHTML = '<pre style="white-space:pre-wrap;margin:0;font:inherit;">'
+                        + escapeHtml(text) + '</pre>';
+                })
+                .catch(() => {
+                    el.innerHTML = '<div style="color:#fca5a5;">Could not load exact text.</div>';
+                });
+        }
     } else {
         el.style.display = 'none';
         arrow.innerHTML = '&#9654;';
-        btn.childNodes[1].textContent = ' Show Full Risk Section';
+        btn.childNodes[1].textContent = ' Show Exact Risk Section';
     }
+}
+
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
 }
 </script>
 {% endblock %}

@@ -1,10 +1,51 @@
 # Crypto SEC Filing Tracker
 
-**v1.1.34** — Batch 1: SEC Filing Tracker
+**v1.1.35** — Batch 1: SEC Filing Tracker
 
 Web app that tracks SEC EDGAR filings for crypto/digital-asset content.
 Extracts risk sections, generates AI summaries, presents an interactive
 dashboard for crypto lawyers.
+
+## What Changed in v1.1.35
+
+### 1. Faster Filing Discovery
+
+Discovery now prefers direct SEC submissions JSON for known CIKs, one pull per
+company, then dedupes by accession before any filing document is fetched. EFTS
+search responses and submissions JSON are cached separately, and already-seen
+accessions are skipped unless a reprocess path asks for cached work.
+
+### 2. Exact Source-Backed Risk Extraction
+
+Risk extraction now stores the actual filing section text before analysis. For
+10-K/10-Q filings it extracts the body `Item 1A` section through the next peer
+item heading. For prospectus and ETF filings it extracts from `Principal
+Investment Risks`, `Principal Risks`, or `Risk Factors` through the next peer
+prospectus section. TOC spans and fee-table spans are rejected.
+
+### 3. Provenance and Hash-Based Analysis Skips
+
+Each extracted risk section records source provenance: accession, document name
+and URL, source hash, exact text hash, extraction method, confidence, and
+offsets where available. Summaries are keyed by exact text hash, so unchanged
+source text skips analysis while new or changed risk text is re-summarized.
+
+### 4. Optional edgartools Fallback
+
+Direct SEC HTTP is now the primary path for submissions and raw document fetches.
+edgartools remains available as a fallback when installed, but Flask startup and
+direct processing no longer depend on edgartools import side effects.
+
+### 5. Verification with Real Filing Text Fixtures
+
+The offline test suite uses saved SEC filing text fixtures from Coinbase's
+2024 10-K and iShares Bitcoin Trust's 2024 424B3 prospectus, then compares
+extracted text against source offsets and exact hashes. Coverage includes 10-K
+body extraction, TOC rejection, prospectus risk extraction, fee-table rejection,
+multi-fund crypto document selection, cache namespacing, submissions-cache
+performance, API filters, exports, and Flask routes. `python test_extraction.py
+--live` re-fetches the curated SEC source documents and verifies the same exact
+hashes without using paid analysis services.
 
 ## What Changed in v1.1.34
 
@@ -35,7 +76,7 @@ are genuinely no new filings on EDGAR since the last run.
 
 ### 3. Automatic Metadata Backfill on Upgrade
 
-When you first run v1.1.34 on an existing database, it automatically
+When you first run v1.1.34+ on an existing database, it automatically
 regenerates Type/Purpose/Holdings for all existing filings using the new
 per-filing template system. No re-scraping required.
 
@@ -178,7 +219,7 @@ crypto_tracker/
   scraper.py          Combined OR-query search + parallel processing
   extractor.py        3-pattern extraction pipeline with confidence scoring
   summarizer.py       Claude Haiku (primary) + template (fallback)
-  filing_metadata.py  Per-filing Type/Purpose/Holdings template engine (v1.1.34)
+  filing_metadata.py  Per-filing Type/Purpose/Holdings template engine
   app.py              Flask routes incl. /api/reprocess for no-rescrape
   templates/          Jinja2 HTML (dashboard, filings, settings, detail)
   static/css/         Dark theme
@@ -200,7 +241,7 @@ Research sources that informed this rewrite:
 
 | Batch | Description | Status |
 |-------|-------------|--------|
-| **1** | SEC Filing Tracker | v1.1.34 current |
+| **1** | SEC Filing Tracker | v1.1.35 current |
 | 2 | Regulatory Action Tracker (SEC/CFTC litigation, no-action letters) | Planned |
 | 3 | Real-Time Alerts (RSS monitors + push notifications) | Planned |
 | 4 | Full SEC Coverage (beyond crypto) | Planned |

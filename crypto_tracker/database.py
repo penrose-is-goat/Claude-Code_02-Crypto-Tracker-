@@ -4,7 +4,7 @@ Database layer for Crypto SEC Filing Tracker.
 NORMALIZED schema (4 tables) replaces v1.1.26's single filings table:
   - filings           : metadata only (one row per filing)
   - filing_documents  : raw cached text of each attachment (one-time fetch)
-  - filing_sections   : extracted section CANDIDATES with confidence scores
+  - filing_sections   : exact extracted section candidates + provenance
   - filing_summaries  : AI/template summaries (regeneratable)
 
 Why normalized? So we can re-extract or re-summarize WITHOUT re-scraping.
@@ -42,13 +42,16 @@ _init_lock = threading.Lock()
 # Bump this whenever the schema or the COMPANY_DETAILS lookup changes.
 # init_db() compares against PRAGMA user_version and only runs DDL/backfill
 # when the on-disk version is behind.
-SCHEMA_VERSION = 3  # v1.1.34: added entity_type column
+SCHEMA_VERSION = 5  # v1.1.35: exact-section provenance + skip-state cache
 
 
 def _ensure_data_dir():
     os.makedirs(config.DATA_DIR, exist_ok=True)
     os.makedirs(config.EXPORT_DIR, exist_ok=True)
     os.makedirs(config.EDGAR_CACHE_DIR, exist_ok=True)
+    raw_doc_cache = getattr(config, "RAW_DOC_CACHE_DIR", "")
+    if raw_doc_cache:
+        os.makedirs(raw_doc_cache, exist_ok=True)
     text_cache = getattr(config, "TEXT_CACHE_DIR", "")
     if text_cache:
         os.makedirs(text_cache, exist_ok=True)
@@ -148,6 +151,12 @@ def _run_ddl(conn):
             text          TEXT NOT NULL,
             char_count    INTEGER DEFAULT 0,
             confidence    REAL DEFAULT 0,
+            source_doc_name TEXT DEFAULT '',
+            source_doc_url  TEXT DEFAULT '',
+            source_hash     TEXT DEFAULT '',
+            exact_text_hash TEXT DEFAULT '',
+            start_offset    INTEGER,
+            end_offset      INTEGER,
             is_primary    INTEGER DEFAULT 0,
             extracted_at  TEXT DEFAULT '',
             FOREIGN KEY (accession_no) REFERENCES filings(accession_no) ON DELETE CASCADE
@@ -163,6 +172,7 @@ def _run_ddl(conn):
             section_id    INTEGER,
             model         TEXT NOT NULL,
             summary       TEXT NOT NULL,
+            text_hash     TEXT DEFAULT '',
             is_current    INTEGER DEFAULT 1,
             created_at    TEXT DEFAULT '',
             FOREIGN KEY (accession_no) REFERENCES filings(accession_no) ON DELETE CASCADE,
@@ -172,11 +182,51 @@ def _run_ddl(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summaries_acc ON filing_summaries(accession_no)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summaries_current ON filing_summaries(accession_no, is_current)")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS filing_attempts (
+            accession_no      TEXT PRIMARY KEY,
+            cik               TEXT DEFAULT '',
+            company_name      TEXT DEFAULT '',
+            ticker            TEXT DEFAULT '',
+            form_type         TEXT DEFAULT '',
+            root_form         TEXT DEFAULT '',
+            filing_date       TEXT DEFAULT '',
+            status            TEXT NOT NULL,
+            reason            TEXT DEFAULT '',
+            processor_version TEXT DEFAULT '',
+            doc_name          TEXT DEFAULT '',
+            doc_url           TEXT DEFAULT '',
+            attempt_count     INTEGER DEFAULT 0,
+            last_attempted_at TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_status ON filing_attempts(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_version ON filing_attempts(processor_version)")
+
     for col in ("purpose", "top_holdings", "entity_type"):
         try:
             conn.execute(f"ALTER TABLE filings ADD COLUMN {col} TEXT DEFAULT ''")
         except Exception:
             pass
+
+    section_columns = {
+        "source_doc_name": "TEXT DEFAULT ''",
+        "source_doc_url": "TEXT DEFAULT ''",
+        "source_hash": "TEXT DEFAULT ''",
+        "exact_text_hash": "TEXT DEFAULT ''",
+        "start_offset": "INTEGER",
+        "end_offset": "INTEGER",
+    }
+    for col, ddl in section_columns.items():
+        try:
+            conn.execute(f"ALTER TABLE filing_sections ADD COLUMN {col} {ddl}")
+        except Exception:
+            pass
+
+    try:
+        conn.execute("ALTER TABLE filing_summaries ADD COLUMN text_hash TEXT DEFAULT ''")
+    except Exception:
+        pass
 
     conn.execute("DROP VIEW IF EXISTS v_filings_display")
     conn.execute("""
@@ -191,8 +241,15 @@ def _run_ddl(conn):
             COALESCE(s.confidence, 0)     AS extraction_confidence,
             COALESCE(s.method, '')        AS extraction_method,
             COALESCE(s.section_type, '')  AS section_type,
+            COALESCE(s.source_doc_name, '') AS source_doc_name,
+            COALESCE(s.source_doc_url, '')  AS source_doc_url,
+            COALESCE(s.source_hash, '')     AS source_hash,
+            COALESCE(s.exact_text_hash, '') AS exact_text_hash,
+            s.start_offset,
+            s.end_offset,
             COALESCE(sm.summary, '')      AS risk_summary,
-            COALESCE(sm.model, '')        AS summary_model
+            COALESCE(sm.model, '')        AS summary_model,
+            COALESCE(sm.text_hash, '')    AS summary_text_hash
         FROM filings f
         LEFT JOIN filing_sections s
             ON s.accession_no = f.accession_no AND s.is_primary = 1
@@ -317,6 +374,53 @@ def upsert_filing(data: dict):
             purpose=excluded.purpose, top_holdings=excluded.top_holdings,
             processed_at=excluded.processed_at
     """, data)
+    conn.execute(
+        "DELETE FROM filing_attempts WHERE accession_no = ?",
+        (data["accession_no"],),
+    )
+
+
+def record_filing_attempt(data: dict, status: str, reason: str):
+    """Persist terminal processing outcomes so Update Filings can skip known
+    no-risk-section documents until the processor version changes."""
+    conn = get_connection()
+    processor_version = getattr(config, "PROCESSOR_VERSION", config.VERSION)
+    now = datetime.now().isoformat()
+    conn.execute("""
+        INSERT INTO filing_attempts (
+            accession_no, cik, company_name, ticker, form_type, root_form,
+            filing_date, status, reason, processor_version, doc_name, doc_url,
+            attempt_count, last_attempted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(accession_no) DO UPDATE SET
+            cik=excluded.cik,
+            company_name=excluded.company_name,
+            ticker=excluded.ticker,
+            form_type=excluded.form_type,
+            root_form=excluded.root_form,
+            filing_date=excluded.filing_date,
+            status=excluded.status,
+            reason=excluded.reason,
+            processor_version=excluded.processor_version,
+            doc_name=excluded.doc_name,
+            doc_url=excluded.doc_url,
+            attempt_count=filing_attempts.attempt_count + 1,
+            last_attempted_at=excluded.last_attempted_at
+    """, (
+        data.get("accession_no", ""),
+        data.get("cik", ""),
+        data.get("company_name", ""),
+        data.get("ticker", ""),
+        data.get("form_type", ""),
+        data.get("root_form", ""),
+        data.get("filing_date", ""),
+        status,
+        reason or "",
+        processor_version,
+        data.get("doc_name", ""),
+        data.get("doc_url", ""),
+        now,
+    ))
 
 
 def replace_documents(accession_no: str, documents: list):
@@ -345,13 +449,20 @@ def replace_sections(accession_no: str, candidates: list):
         conn.execute("""
             INSERT INTO filing_sections
                 (accession_no, section_type, method, title, text, char_count,
-                 confidence, is_primary, extracted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 confidence, source_doc_name, source_doc_url, source_hash,
+                 exact_text_hash, start_offset, end_offset, is_primary, extracted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             accession_no, c.get("section_type", "risk_factors"),
             c.get("method", "unknown"), c.get("title", ""),
             c.get("text", ""), len(c.get("text", "")),
             float(c.get("confidence", 0)),
+            c.get("source_doc_name", ""),
+            c.get("source_doc_url", ""),
+            c.get("source_hash", ""),
+            c.get("exact_text_hash", ""),
+            c.get("start_offset"),
+            c.get("end_offset"),
             1 if i == 0 else 0, now,
         ))
 
@@ -365,7 +476,8 @@ def get_primary_section_id(accession_no: str):
     return row["id"] if row else None
 
 
-def upsert_summary(accession_no: str, summary: str, model: str, section_id=None):
+def upsert_summary(accession_no: str, summary: str, model: str, section_id=None,
+                   text_hash: str = ""):
     """Replace the current summary. Old summaries stay but lose is_current."""
     conn = get_connection()
     conn.execute(
@@ -374,9 +486,18 @@ def upsert_summary(accession_no: str, summary: str, model: str, section_id=None)
     )
     conn.execute("""
         INSERT INTO filing_summaries
-            (accession_no, section_id, model, summary, is_current, created_at)
-        VALUES (?, ?, ?, ?, 1, ?)
-    """, (accession_no, section_id, model, summary, datetime.now().isoformat()))
+            (accession_no, section_id, model, summary, text_hash, is_current, created_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?)
+    """, (accession_no, section_id, model, summary, text_hash, datetime.now().isoformat()))
+
+
+def get_current_summary_hash(accession_no: str):
+    row = get_connection().execute(
+        "SELECT text_hash FROM filing_summaries "
+        "WHERE accession_no = ? AND is_current = 1",
+        (accession_no,),
+    ).fetchone()
+    return row["text_hash"] if row else ""
 
 
 def commit():
@@ -389,13 +510,37 @@ def commit():
 
 def get_existing_accessions():
     conn = get_connection()
-    rows = conn.execute("SELECT accession_no FROM filings").fetchall()
+    processor_version = getattr(config, "PROCESSOR_VERSION", config.VERSION)
+    rows = conn.execute("""
+        SELECT accession_no FROM filings
+        UNION
+        SELECT accession_no
+        FROM filing_attempts
+        WHERE status = 'skipped' AND processor_version = ?
+    """, (processor_version,)).fetchall()
     return {r["accession_no"] for r in rows}
+
+
+def get_attempt_count(status=None, reason=None):
+    conn = get_connection()
+    conditions = []
+    params = []
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if reason:
+        conditions.append("reason = ?")
+        params.append(reason)
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    return conn.execute(
+        f"SELECT COUNT(*) AS c FROM filing_attempts{where}",
+        params,
+    ).fetchone()["c"]
 
 
 def get_filing_count():
     return get_connection().execute(
-        "SELECT COUNT(*) AS c FROM v_filings_display WHERE risk_summary != ''"
+        "SELECT COUNT(*) AS c FROM v_filings_display WHERE risk_section != ''"
     ).fetchone()["c"]
 
 
@@ -409,7 +554,7 @@ def get_total_filing_count():
 def get_all_filings(order_by="filing_date DESC"):
     conn = get_connection()
     rows = conn.execute(
-        f"SELECT * FROM v_filings_display WHERE risk_summary != '' ORDER BY {order_by}"
+        f"SELECT * FROM v_filings_display WHERE risk_section != '' ORDER BY {order_by}"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -426,7 +571,9 @@ def get_filing_by_accession(accession_no):
     data["sections"] = [
         dict(r) for r in conn.execute(
             "SELECT id, section_type, method, title, char_count, confidence, "
-            "is_primary FROM filing_sections WHERE accession_no = ? "
+            "source_doc_name, source_doc_url, source_hash, exact_text_hash, "
+            "start_offset, end_offset, is_primary "
+            "FROM filing_sections WHERE accession_no = ? "
             "ORDER BY is_primary DESC, confidence DESC",
             (accession_no,),
         ).fetchall()
@@ -459,61 +606,73 @@ def get_dashboard_stats():
     conn = get_connection()
 
     total = conn.execute(
-        "SELECT COUNT(*) AS c FROM v_filings_display WHERE risk_summary != ''"
+        "SELECT COUNT(*) AS c FROM v_filings_display WHERE risk_section != ''"
     ).fetchone()["c"]
+    analysis_complete = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM filing_sections sec
+        JOIN filing_summaries sm
+          ON sm.accession_no = sec.accession_no
+         AND sm.is_current = 1
+         AND COALESCE(sm.text_hash, '') = COALESCE(sec.exact_text_hash, '')
+        WHERE sec.is_primary = 1 AND sec.text != ''
+    """).fetchone()["c"]
+    analysis_pending = max(0, total - analysis_complete)
     companies = conn.execute(
         "SELECT COUNT(DISTINCT company_name) AS c FROM v_filings_display "
-        "WHERE risk_summary != ''"
+        "WHERE risk_section != ''"
     ).fetchone()["c"]
     etf_count = conn.execute(
         "SELECT COUNT(*) AS c FROM v_filings_display "
-        "WHERE filing_category='ETF/Fund' AND risk_summary != ''"
+        "WHERE filing_category='ETF/Fund' AND risk_section != ''"
     ).fetchone()["c"]
     oper_count = conn.execute(
         "SELECT COUNT(*) AS c FROM v_filings_display "
-        "WHERE filing_category='Operating Co.' AND risk_summary != ''"
+        "WHERE filing_category='Operating Co.' AND risk_section != ''"
     ).fetchone()["c"]
 
     monthly = conn.execute("""
         SELECT substr(filing_date,1,7) AS month, COUNT(*) AS count
-        FROM v_filings_display WHERE risk_summary != '' AND filing_date != ''
+        FROM v_filings_display WHERE risk_section != '' AND filing_date != ''
         GROUP BY month ORDER BY month
     """).fetchall()
 
     top_companies = conn.execute("""
         SELECT company_name, COUNT(*) AS count
-        FROM v_filings_display WHERE risk_summary != ''
+        FROM v_filings_display WHERE risk_section != ''
         GROUP BY company_name ORDER BY count DESC LIMIT 15
     """).fetchall()
 
     form_types = conn.execute("""
         SELECT filing_category, form_type, COUNT(*) AS count
-        FROM v_filings_display WHERE risk_summary != ''
+        FROM v_filings_display WHERE risk_section != ''
         GROUP BY filing_category, form_type ORDER BY count DESC
     """).fetchall()
 
     keywords = conn.execute("""
         SELECT search_keyword, COUNT(*) AS count
         FROM v_filings_display
-        WHERE risk_summary != '' AND search_keyword != ''
+        WHERE risk_section != '' AND search_keyword != ''
         GROUP BY search_keyword ORDER BY count DESC LIMIT 10
     """).fetchall()
 
     categories = conn.execute("""
         SELECT filing_category, COUNT(*) AS count
-        FROM v_filings_display WHERE risk_summary != ''
+        FROM v_filings_display WHERE risk_section != ''
         GROUP BY filing_category ORDER BY count DESC
     """).fetchall()
 
     daily = conn.execute("""
         SELECT filing_date, COUNT(*) AS count
-        FROM v_filings_display WHERE risk_summary != '' AND filing_date != ''
+        FROM v_filings_display WHERE risk_section != '' AND filing_date != ''
         GROUP BY filing_date ORDER BY filing_date DESC LIMIT 30
     """).fetchall()
 
     return {
         "total": total, "companies": companies,
         "etf_count": etf_count, "oper_count": oper_count,
+        "analysis_complete": analysis_complete,
+        "analysis_pending": analysis_pending,
         "monthly": [dict(r) for r in monthly],
         "top_companies": [dict(r) for r in top_companies],
         "form_types": [dict(r) for r in form_types],
@@ -524,9 +683,10 @@ def get_dashboard_stats():
 
 
 def get_filtered_filings(company=None, form_type=None, month=None,
-                         category=None, keyword=None, search=None):
+                         category=None, keyword=None, search=None,
+                         limit=None, offset=None):
     conn = get_connection()
-    conditions = ["risk_summary != ''"]
+    conditions = ["risk_section != ''"]
     params = []
     if company:
         conditions.append("company_name LIKE ?")
@@ -545,14 +705,20 @@ def get_filtered_filings(company=None, form_type=None, month=None,
         params.append(keyword)
     if search:
         conditions.append(
-            "(company_name LIKE ? OR risk_summary LIKE ? OR form_type LIKE ?)"
+            "(company_name LIKE ? OR risk_summary LIKE ? OR risk_section LIKE ? OR form_type LIKE ?)"
         )
-        params.extend([f"%{search}%"] * 3)
+        params.extend([f"%{search}%"] * 4)
     where = " AND ".join(conditions)
-    rows = conn.execute(
-        f"SELECT * FROM v_filings_display WHERE {where} ORDER BY filing_date DESC",
-        params,
-    ).fetchall()
+    sql = f"SELECT * FROM v_filings_display WHERE {where} ORDER BY filing_date DESC"
+    if limit is not None:
+        limit = max(1, min(int(limit), 5000))
+        sql += " LIMIT ?"
+        params.append(limit)
+        if offset is not None:
+            offset = max(0, int(offset))
+            sql += " OFFSET ?"
+            params.append(offset)
+    rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 

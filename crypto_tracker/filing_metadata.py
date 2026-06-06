@@ -1,5 +1,5 @@
 """
-Per-filing contextual metadata generator (v1.1.34).
+Per-filing contextual metadata generator (v1.1.35).
 
 Produces human-readable Type, Purpose, and Holdings strings for each filing
 based on what the entity IS (ETF, miner, exchange, etc.) and what this

@@ -1,11 +1,11 @@
-# Crypto SEC Filing Tracker v1.1.27 — Dependencies
+# Crypto SEC Filing Tracker v1.1.35 — Dependencies
 # Install: pip install -r requirements.txt
 
 # Web framework
 flask>=3.0.0
 
-# SEC EDGAR access (v5.30+ needed for local cache + Fund API)
-edgartools>=5.30.0
+# SEC EDGAR access. v1.1.35 uses direct SEC HTTP first; edgartools is fallback.
+edgartools>=4.6.3,<5
 requests>=2.31.0
 
 # HTML parsing

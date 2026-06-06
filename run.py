@@ -22,6 +22,30 @@ def main():
         help="Run the EDGAR scraper only (no web server)"
     )
     parser.add_argument(
+        "--mode",
+        default=None,
+        choices=["exact_only", "analysis_only", "low_confidence_only", "all_cached"],
+        help="Scrape/reprocess mode (default: exact_only)"
+    )
+    parser.add_argument(
+        "--scope",
+        default=None,
+        choices=["risk_default", "core", "event_risk", "all"],
+        help="Filing discovery scope (default: risk_default)"
+    )
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="Append this run to the markdown benchmark summary"
+    )
+    parser.add_argument(
+        "--clear-filings", action="store_true",
+        help="Clear filing tables before running the scraper"
+    )
+    parser.add_argument(
+        "--clear-caches", action="store_true",
+        help="Clear EFTS/submissions/raw/text caches before running the scraper"
+    )
+    parser.add_argument(
         "--host", default=None,
         help="Host to bind the web server to (default: 127.0.0.1)"
     )
@@ -41,16 +65,34 @@ def main():
         print("  CRYPTO SEC FILING TRACKER — Scraper Mode")
         print("=" * 70)
 
-        from crypto_tracker.scraper import run_scraper
+        from crypto_tracker.scraper import (
+            clear_filings_data,
+            clear_runtime_caches,
+            run_scraper,
+        )
         from crypto_tracker.database import init_db
         init_db()
 
-        result = run_scraper()
+        if args.clear_filings:
+            print("  Clearing filing tables...")
+            clear_filings_data()
+        if args.clear_caches:
+            print("  Clearing runtime caches...")
+            clear_runtime_caches()
+
+        result = run_scraper(
+            mode=args.mode,
+            scope=args.scope,
+            benchmark=args.benchmark,
+        )
         print(f"\n  RESULTS:")
+        print(f"    Mode/scope:   {result.get('mode')} / {result.get('scope')}")
         print(f"    New found:    {result['new_found']}")
-        print(f"    Saved:        {result['saved']}")
+        print(f"    Saved exact:  {result['saved']}")
+        print(f"    Skipped:      {result.get('skipped', 0)}")
         print(f"    Failed:       {result['failed']}")
-        print(f"    Total in DB:  {result['total_in_db']}")
+        print(f"    Reprocessed:  {result.get('reprocessed', 0)}")
+        print(f"    Total exact:  {result['total_in_db']}")
         print("=" * 70)
     else:
         # Start web server

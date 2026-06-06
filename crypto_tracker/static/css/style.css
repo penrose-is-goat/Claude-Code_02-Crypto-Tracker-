@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   Crypto SEC Filing Tracker v1.1.31 — Modern Dark Theme
+   Crypto SEC Filing Tracker v1.1.35 — Modern Dark Theme
    Less retro, more readable. Inter for UI, monospace for data values.
    ═══════════════════════════════════════════════════════════════════════ */
 
@@ -16,6 +16,7 @@ body {
     line-height: 1.5;
     min-height: 100vh;
 }
+html { -webkit-text-size-adjust: 100%; }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
@@ -57,6 +58,16 @@ a:hover { color: #a5b4fc; text-decoration: underline; }
 .nav-brand:hover { text-decoration: none; color: inherit; }
 .nav-icon { font-size: 22px; }
 .nav-title { font-weight: 700; font-size: 14px; letter-spacing: -0.01em; }
+.version-pill {
+    font-size: 11px;
+    color: #a5b4fc;
+    font-weight: 700;
+    background: #1e293b;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 4px;
+    white-space: nowrap;
+}
 .nav-sub { font-size: 10px; color: #64748b; letter-spacing: 0.02em; margin-top: 1px; }
 .nav-links { display: flex; align-items: center; gap: 6px; }
 .nav-link {
@@ -88,6 +99,7 @@ a:hover { color: #a5b4fc; text-decoration: underline; }
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    min-height: 34px;
 }
 .btn:hover { border-color: #6366f1; color: #c7d2fe; text-decoration: none; }
 .btn-primary {
@@ -167,7 +179,7 @@ a:hover { color: #a5b4fc; text-decoration: underline; }
 .card {
     background: #141924;
     border: 1px solid #1e293b;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 16px;
     margin-bottom: 10px;
 }
@@ -189,7 +201,7 @@ a:hover { color: #a5b4fc; text-decoration: underline; }
 /* ─── Stat Cards ───────────────────────────────────────────────────── */
 .stat-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 10px;
     margin: 18px 0 14px 0;
 }
@@ -217,6 +229,27 @@ a:hover { color: #a5b4fc; text-decoration: underline; }
     grid-template-columns: 1fr 1fr;
     gap: 10px;
     margin-bottom: 10px;
+}
+.chart-card {
+    min-width: 0;
+}
+.chart-frame {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+}
+.chart-frame--short {
+    height: 180px;
+}
+.chart-frame--tall {
+    height: 240px;
+}
+.chart-card canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+    max-height: 100%;
 }
 canvas { cursor: pointer; }
 
@@ -246,6 +279,8 @@ th {
 .table-scroll {
     overflow: auto;
     max-height: 600px;
+    width: 100%;
+    -webkit-overflow-scrolling: touch;
 }
 .clickable-row {
     cursor: pointer;
@@ -303,6 +338,8 @@ th {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
 }
 .filter-tag-remove {
     color: #fca5a5;
@@ -333,6 +370,9 @@ th {
     gap: 8px;
     align-items: center;
     flex-wrap: wrap;
+}
+.filters-form > * {
+    min-height: 36px;
 }
 .search-input {
     font-family: inherit;
@@ -458,6 +498,7 @@ th {
     font-size: 12px;
     line-height: 1.8;
     color: #e2e8f0;
+    overflow-wrap: anywhere;
 }
 
 /* ─── Export hint banner (v1.1.33) ─────────────────────────────────── */
@@ -499,6 +540,10 @@ th {
 /* ─── Risk Section Dropdown ────────────────────────────────────────── */
 .risk-dropdown {
     margin-top: 10px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 .btn-risk-toggle {
     background: #1e293b;
@@ -517,6 +562,7 @@ th {
     color: #c7d2fe;
 }
 .risk-content {
+    flex-basis: 100%;
     margin-top: 10px;
     padding: 18px 22px;
     background: #0f1219;
@@ -602,16 +648,38 @@ th {
 
 /* ─── Responsive ───────────────────────────────────────────────────── */
 @media (max-width: 768px) {
+    .container { padding: 0 14px; }
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
     .chart-grid { grid-template-columns: 1fr; }
+    .chart-frame--short { height: 190px; }
+    .chart-frame--tall { height: 260px; }
     .nav-inner { flex-direction: column; gap: 8px; }
-    .nav-links { flex-wrap: wrap; justify-content: center; }
+    .nav-brand { align-items: flex-start; width: 100%; }
+    .nav-links { flex-wrap: wrap; justify-content: center; width: 100%; }
+    .nav-actions { margin-left: 0; flex-wrap: wrap; justify-content: center; }
+    .nav-link, .btn { min-height: 36px; }
     .filters-form { flex-direction: column; }
+    .filters-form > * { width: 100%; }
     .search-input { width: 100%; min-width: unset; }
     .filter-select { width: 100%; }
-    .filing-header { flex-direction: column; }
+    .filing-header { flex-direction: column; align-items: stretch; }
+    .filing-header-right { white-space: normal; flex-wrap: wrap; }
+    .filing-company { overflow-wrap: anywhere; }
+    .table-scroll table { min-width: 720px; }
     .detail-grid { grid-template-columns: 1fr; }
     .footer-inner { flex-direction: column; gap: 8px; }
+    .footer-links { flex-wrap: wrap; gap: 8px 14px; }
     .page-header { flex-direction: column; }
+    .filing-header-right, .filing-header-left { width: 100%; }
     .filing-detail-row { flex-direction: column; gap: 2px; }
+}
+
+@media (max-width: 480px) {
+    .stat-grid { grid-template-columns: 1fr; }
+    .card { padding: 14px; }
+    .stat-value { font-size: 22px; }
+    .nav-title { font-size: 13px; }
+    .scraper-bar-inner { flex-wrap: wrap; }
+    .scraper-progress-wrap { flex-basis: 100%; }
+    .risk-content { padding: 14px; }
 }

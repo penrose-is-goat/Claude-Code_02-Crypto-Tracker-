@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Settings - Crypto SEC Filing Tracker{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1 class="page-title">SETTINGS</h1>
+        <p class="page-subtitle">Configuration, API keys, and system information</p>
+    </div>
+</div>
+
+<!-- VERSION INFO -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">VERSION</div>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Version</div>
+            <div class="detail-value">v{{ config.VERSION }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Batch</div>
+            <div class="detail-value">{{ config.VERSION_NAME }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Last Scrape</div>
+            <div class="detail-value">{{ scraper_status.last_run or 'Never' }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- EDGAR IDENTITY -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">SEC EDGAR IDENTITY</div>
+    <p style="font-size:10px;color:#64748b;margin:4px 0 8px 0;">
+        Required by SEC fair-access policy. Used in all requests to EDGAR.
+    </p>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Identity</div>
+            <div class="detail-value">{{ config.SEC_IDENTITY }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- API KEYS -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">API KEYS</div>
+    <p style="font-size:10px;color:#64748b;margin:4px 0 8px 0;">
+        Optional. Set API keys in config.py or as environment variables.
+        Without API keys, the app uses free extractive summarization.
+    </p>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Anthropic API Key</div>
+            <div class="detail-value">
+                {% if config.ANTHROPIC_API_KEY %}
+                <span style="color:#86efac;">Configured</span>
+                ({{ config.ANTHROPIC_API_KEY[:8] }}...)
+                {% else %}
+                <span style="color:#64748b;">Not set</span>
+                — using extractive summarization
+                {% endif %}
+            </div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Summary Model</div>
+            <div class="detail-value">{{ config.SUMMARY_MODEL }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- SCRAPING PARAMETERS -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">SCRAPING PARAMETERS</div>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Date Range</div>
+            <div class="detail-value">{{ config.START_DATE }} to {{ config.END_DATE }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Threads</div>
+            <div class="detail-value">{{ config.NUM_THREADS }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Max per Keyword</div>
+            <div class="detail-value">{{ config.MAX_PER_KEYWORD }}</div>
+        </div>
+    </div>
+    <div style="margin-top:12px;">
+        <div class="detail-label">Search Keywords</div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
+            {% for kw in config.KEYWORDS %}
+            <span class="badge badge-other">{{ kw }}</span>
+            {% endfor %}
+        </div>
+    </div>
+    <div style="margin-top:12px;">
+        <div class="detail-label">Form Types</div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
+            {% for ft in config.FORM_TYPES %}
+            <span class="badge badge-etf">{{ ft }}</span>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<!-- DATABASE INFO -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">DATABASE</div>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Path</div>
+            <div class="detail-value" style="font-size:10px;word-break:break-all;">{{ config.DB_PATH }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Total Filings</div>
+            <div class="detail-value">{{ db_count }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Export</div>
+            <div class="detail-value">
+                <a href="/api/export/csv" class="btn btn-sm">CSV</a>
+                <a href="/api/export/xlsx" class="btn btn-sm" style="margin-left:4px;">Excel</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- DOCUMENTATION -->
+<div class="card" style="margin-bottom:12px;">
+    <div class="card-title">DOCUMENTATION</div>
+    <div style="margin-top:8px;font-size:11px;line-height:1.8;">
+        <div style="margin-bottom:8px;">
+            <a href="https://github.com/penrose-is-goat/Claude-Code_02-Crypto-Tracker-" target="_blank" class="link">
+                GitHub Repository &rarr;
+            </a>
+        </div>
+        <div style="margin-bottom:8px;">
+            <strong>Data Sources:</strong>
+            <ul style="margin-left:16px;margin-top:4px;color:#94a3b8;">
+                <li><a href="https://efts.sec.gov/LATEST/" target="_blank" class="link">SEC EDGAR Full-Text Search (EFTS)</a></li>
+                <li><a href="https://www.sec.gov/digital-assets" target="_blank" class="link">SEC Digital Assets Page</a></li>
+                <li><a href="https://pypi.org/project/edgartools/" target="_blank" class="link">edgartools Python Library</a></li>
+            </ul>
+        </div>
+        <div>
+            <strong>Architecture:</strong>
+            <span style="color:#94a3b8;">
+                Python/Flask backend + SQLite database + Jinja2 templates + Chart.js.
+                Uses edgartools for EDGAR API access. Filing documents parsed via
+                Filing.sections(), Filing.search(), and Attachment.text().
+            </span>
+        </div>
+    </div>
+</div>
+
+<!-- SCRAPER STATUS -->
+<div class="card">
+    <div class="card-title">SCRAPER STATUS</div>
+    <div class="detail-grid" style="margin-top:8px;">
+        <div class="detail-item">
+            <div class="detail-label">Running</div>
+            <div class="detail-value">
+                {% if scraper_status.running %}
+                <span style="color:#fcd34d;">Yes — {{ scraper_status.message }}</span>
+                {% else %}
+                <span style="color:#86efac;">Idle</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Last Message</div>
+            <div class="detail-value">{{ scraper_status.message }}</div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Progress</div>
+            <div class="detail-value">{{ scraper_status.saved }} saved / {{ scraper_status.failed }} failed</div>
+        </div>
+    </div>
+</div>
+{% endblock %}

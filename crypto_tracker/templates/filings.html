@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}All Filings - Crypto SEC Filing Tracker{% endblock %}
+
+{% block content %}
+<!-- PAGE HEADER -->
+<div class="page-header">
+    <div>
+        <h1 class="page-title">ALL FILINGS</h1>
+        <p class="page-subtitle">
+            {{ filings | length }} filings | Filterable by date, company, type |
+            AI summaries + full risk section dropdowns
+        </p>
+    </div>
+    <div class="filing-header-right">
+        <a href="/api/export/xlsx{% if request.query_string %}?{{ request.query_string.decode() }}{% endif %}"
+           class="btn btn-primary" title="Download all filings (or current filter) as Excel — includes full risk-section text">
+            &#8615; Download Excel
+        </a>
+        <a href="/api/export/csv{% if request.query_string %}?{{ request.query_string.decode() }}{% endif %}"
+           class="btn" title="Download as CSV (UTF-8, full risk text included)">
+            &#8615; CSV
+        </a>
+    </div>
+</div>
+<div class="export-hint">
+    Tip: the buttons above export the <strong>same data shown below</strong> (including full risk-section text)
+    into Excel/CSV. The raw <code>.db</code> file on disk is a binary SQLite database and won't open in Excel.
+</div>
+
+<!-- ACTIVE FILTERS -->
+{% if active_filters %}
+<div class="filter-bar" style="display:flex;">
+    <span class="filter-label">FILTERED BY:</span>
+    {% for key, val in active_filters.items() %}
+    <span class="filter-tag">
+        {{ key }}: {{ val }}
+        <a href="{{ request.path }}?{{ request.query_string.decode().replace(key + '=' + val, '').replace('&&','&').strip('&') }}"
+           class="filter-tag-remove">&#10005;</a>
+    </span>
+    {% endfor %}
+    <a href="/filings" class="btn-clear">&#10005; CLEAR ALL</a>
+</div>
+{% endif %}
+
+<!-- FILTERS ROW -->
+<div class="filters-row">
+    <form method="GET" action="/filings" class="filters-form">
+        <input type="text" name="search" placeholder="Search all fields..."
+               value="{{ active_filters.get('search', '') }}" class="search-input">
+        <select name="form_type" class="filter-select" onchange="this.form.submit()">
+            <option value="">All Form Types</option>
+            {% for ft_key in form_desc.keys() %}
+            <option value="{{ ft_key }}" {% if active_filters.get('form_type') == ft_key %}selected{% endif %}>
+                {{ ft_key }} - {{ form_desc[ft_key] }}
+            </option>
+            {% endfor %}
+        </select>
+        <select name="category" class="filter-select" onchange="this.form.submit()">
+            <option value="">All Categories</option>
+            <option value="ETF/Fund" {% if active_filters.get('category') == 'ETF/Fund' %}selected{% endif %}>ETF/Fund</option>
+            <option value="Operating Co." {% if active_filters.get('category') == 'Operating Co.' %}selected{% endif %}>Operating Co.</option>
+        </select>
+        <input type="month" name="month" value="{{ active_filters.get('month', '') }}"
+               class="filter-select" onchange="this.form.submit()">
+        <button type="submit" class="btn btn-primary">Filter</button>
+    </form>
+</div>
+
+<!-- FILINGS LIST -->
+<div id="filings-list">
+    {% if filings %}
+    {% for f in filings %}
+    <div class="filing-card card" id="filing-{{ loop.index }}">
+        <!-- Header Row -->
+        <div class="filing-header">
+            <div class="filing-header-left">
+                <a href="/filing/{{ f.accession_no }}" class="filing-company link">
+                    {{ f.company_name }}
+                </a>
+                {% if f.ticker %}
+                <span class="filing-ticker">{{ f.ticker }}</span>
+                {% endif %}
+                <span class="badge badge-{{ f.form_type | replace('/', '') | replace('-', '') | lower }}">
+                    {{ f.form_type }}
+                </span>
+                <span class="filing-meta">
+                    {{ f.filing_date[:10] if f.filing_date else 'N/A' }}
+                    &middot; {{ f.filing_category }}
+                    &middot; {{ '{:,}'.format(f.text_length) }}ch
+                    {% if f.extraction_confidence %}
+                    &middot;
+                    {% if f.extraction_confidence >= 0.7 %}
+                        <span style="color:#86efac;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% elif f.extraction_confidence >= 0.4 %}
+                        <span style="color:#fcd34d;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% else %}
+                        <span style="color:#fca5a5;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                    {% endif %}
+                    {% endif %}
+                    {% if f.extraction_method %}
+                    &middot; <span style="color:#64748b;">{{ f.extraction_method }}</span>
+                    {% endif %}
+                </span>
+            </div>
+            <div class="filing-header-right">
+                {% if f.filing_pdf_url %}
+                <a href="{{ f.filing_pdf_url }}" target="_blank" class="btn btn-sm">PDF</a>
+                {% endif %}
+                <a href="{{ f.sec_url }}" target="_blank" class="link">SEC.gov &rarr;</a>
+            </div>
+        </div>
+
+        <!-- Filing Details (purpose, holdings) -->
+        <div class="filing-details">
+            {% if f.purpose %}
+            <div class="filing-detail-row">
+                <span class="filing-detail-label">Purpose</span>
+                <span class="filing-detail-value">{{ f.purpose }}</span>
+            </div>
+            {% endif %}
+            {% if f.top_holdings %}
+            <div class="filing-detail-row">
+                <span class="filing-detail-label">Holdings</span>
+                <span class="filing-holdings">{{ f.top_holdings }}</span>
+            </div>
+            {% endif %}
+            {% if not f.purpose and not f.top_holdings %}
+            <div class="filing-detail-row">
+                <span class="filing-detail-label">Type</span>
+                <span class="filing-detail-value">{{ f.crypto_connection }}</span>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Risk Summary -->
+        <div class="risk-summary-label">RISK FACTOR SUMMARY</div>
+        <div class="risk-summary-box">
+            {{ f.risk_summary }}
+        </div>
+
+        <!-- Risk Section Dropdown -->
+        {% if f.risk_section and f.risk_section | length > 40 %}
+        <div class="risk-dropdown">
+            <button class="btn-risk-toggle" onclick="toggleRisk({{ loop.index }})">
+                <span id="arrow-{{ loop.index }}">&#9654;</span> Show Full Risk Section
+                <span style="color:#64748b;font-weight:400;margin-left:4px;">({{ '{:,}'.format(f.risk_section | length) }} chars)</span>
+            </button>
+            <div id="risk-{{ loop.index }}" class="risk-content" style="display:none;">
+                {{ f.risk_html | safe }}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+    {% else %}
+    <div class="empty-state card">
+        <div class="empty-icon">&#128269;</div>
+        <div class="empty-title">No filings found</div>
+        <div class="empty-text">
+            {% if active_filters %}
+            No filings match your current filters. Try broadening your search or
+            <a href="/filings" class="link">clear all filters</a>.
+            {% else %}
+            The database is empty. Click "Update Filings" in the navigation bar to
+            scrape SEC EDGAR for crypto-related filings.
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<!-- PAGINATION INFO -->
+{% if filings %}
+<div class="pagination-info">
+    Showing {{ filings | length }} filing{{ 's' if filings | length != 1 else '' }}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function toggleRisk(idx) {
+    const el = document.getElementById('risk-' + idx);
+    const arrow = document.getElementById('arrow-' + idx);
+    const btn = arrow.parentElement;
+    if (el.style.display === 'none') {
+        el.style.display = 'block';
+        arrow.innerHTML = '&#9660;';
+        btn.childNodes[1].textContent = ' Hide Risk Section';
+    } else {
+        el.style.display = 'none';
+        arrow.innerHTML = '&#9654;';
+        btn.childNodes[1].textContent = ' Show Full Risk Section';
+    }
+}
+</script>
+{% endblock %}

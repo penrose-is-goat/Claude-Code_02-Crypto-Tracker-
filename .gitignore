@@ -19,3 +19,5 @@ crypto_tracker/data/
 *.egg-info/
 dist/
 build/
+.runtime_cache/
+.runtime_data/

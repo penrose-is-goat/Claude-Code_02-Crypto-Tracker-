@@ -1,5 +1,11 @@
 """
-SEC EDGAR Scraper v1.1.35.
+SEC EDGAR Scraper v1.1.36.
+
+v1.1.36 changes:
+- edgartools fallback bounded by a concurrency gate + its own low rate
+  limit + longer pool timeout; transient timeouts retried (PoolTimeout fix)
+- Empty fetched text is a retryable failure, never a terminal skip
+- Missing doc URLs resolved via direct archive index before edgartools
 
 v1.1.35 changes:
 - Prefers direct SEC submissions/archive HTTP for faster discovery and fetch
@@ -42,6 +48,15 @@ if config.USE_EDGAR_LOCAL_CACHE:
     os.environ.setdefault("EDGAR_LOCAL_DATA_DIR", config.EDGAR_CACHE_DIR)
     os.environ.setdefault("EDGAR_DATA_DIR", config.EDGAR_CACHE_DIR)
 
+# edgartools runs its own client-side throttle (default 9 req/s). Our direct
+# requests already pace at SEC_TARGET_REQUESTS_PER_SECOND, so left at its
+# default the combined rate can exceed SEC's 10/s and trigger 429 storms.
+# Must be set before `import edgar` — the limiter is built at import time.
+os.environ.setdefault(
+    "EDGAR_RATE_LIMIT_PER_SEC",
+    str(int(getattr(config, "EDGARTOOLS_RATE_LIMIT_PER_SEC", 2))),
+)
+
 try:
     from edgar import set_identity, get_by_accession_number
     HAS_EDGAR = True
@@ -74,6 +89,14 @@ from .summarizer import build_summary
 # ─── One-time setup ──────────────────────────────────────────────────────
 if HAS_EDGAR:
     set_identity(config.SEC_IDENTITY)
+    # edgartools' httpx client defaults to a 5s pool timeout. Under load,
+    # waiting for its throttled connection pool routinely exceeds that and
+    # every call dies with PoolTimeout(''). Raise all timeouts to match ours.
+    try:
+        from edgar.httpclient import configure_http
+        configure_http(timeout=float(getattr(config, "HTTP_TIMEOUT", 30)))
+    except Exception:
+        pass  # older edgartools without configure_http — gate still protects us
 
 # Enable edgartools local storage cache (v1.1.27 speed fix).
 # All subsequent Filing.text()/.html()/.attachments calls hit disk after
@@ -93,6 +116,38 @@ elif not HAS_EDGAR:
     print(f"  edgartools unavailable: using direct SEC HTTP where possible ({_label}: {_msg[:120]})")
 
 _lock = threading.RLock()
+
+# Gate around ALL edgartools network calls. edgartools shares one throttled
+# httpx client across threads; letting IO_THREADS workers queue on it is what
+# produced the PoolTimeout('') storms and 0.1 filings/sec in v1.1.34 runs.
+_edgar_gate = threading.BoundedSemaphore(
+    max(1, int(getattr(config, "EDGARTOOLS_MAX_CONCURRENCY", 2)))
+)
+
+
+def _is_transient_net_error(e: Exception) -> bool:
+    name = type(e).__name__
+    return "Timeout" in name or name in (
+        "ConnectError", "ReadError", "RemoteProtocolError", "PoolTimeout",
+    )
+
+
+def _edgar_call(fn, *args, **kwargs):
+    """Run an edgartools call under the concurrency gate, retrying
+    transient timeouts (PoolTimeout/ReadTimeout/...) before giving up."""
+    retries = max(0, int(getattr(config, "EDGARTOOLS_RETRIES", 2)))
+    delay = float(getattr(config, "EDGARTOOLS_RETRY_DELAY", 3.0))
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with _edgar_gate:
+                return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if not _is_transient_net_error(e) or attempt >= retries:
+                raise
+            time.sleep(delay * (attempt + 1))
+    raise last
 
 
 def _candidate_sort_key(c):
@@ -1031,14 +1086,14 @@ def _fetch_company_filings(cik: str, name: str, ticker: str, category: str,
         return ("lookup_error", name, direct_error, out)
 
     try:
-        company = Company(cik)
+        company = _edgar_call(Company, cik)
     except Exception as e:
         return ("lookup_error", name, _fmt_exc(e), out)
 
     err_forms = []
     for form in forms:
         try:
-            filings = company.get_filings(form=form)
+            filings = _edgar_call(company.get_filings, form=form)
             if filings is None:
                 continue
             count = 0
@@ -1410,9 +1465,13 @@ def process_one_filing(item, mode: str = None):
         full_text = ""
         direct_fetch_error = None
         current_doc_rank = _candidate_doc_rank(item)[0]
+        # Resolve the primary document via the direct archive index when the
+        # candidate has no doc URL at all (keeps the filing on the direct
+        # requests path instead of the edgartools fallback), or when the URL
+        # we have looks low-quality.
         should_resolve_primary = (
-            doc_url
-            and (current_doc_rank >= 50 or root_form in config.ETF_FUND_FORMS)
+            (not doc_url and cik)
+            or (doc_url and (current_doc_rank >= 50 or root_form in config.ETF_FUND_FORMS))
         )
         if should_resolve_primary:
             try:
@@ -1423,7 +1482,8 @@ def process_one_filing(item, mode: str = None):
                 )
                 replacement_rank = _candidate_doc_rank(replacement)[0]
                 if primary_url and (
-                    replacement_rank < current_doc_rank
+                    not doc_url
+                    or replacement_rank < current_doc_rank
                     or (replacement_rank == current_doc_rank and primary_url != doc_url)
                 ):
                     doc_url = primary_url
@@ -1439,7 +1499,7 @@ def process_one_filing(item, mode: str = None):
 
         if not full_text and HAS_EDGAR:
             try:
-                filing = get_by_accession_number(acc)
+                filing = _edgar_call(get_by_accession_number, acc)
             except Exception as e:
                 if isinstance(e, SecRateLimitError):
                     return _fail_result(acc, "sec_rate_limited")
@@ -1450,7 +1510,7 @@ def process_one_filing(item, mode: str = None):
 
             # 1) Fetch text + html (cached locally by edgartools on first run)
             try:
-                full_text, raw_html = fetch_filing_text(filing)
+                full_text, raw_html = _edgar_call(fetch_filing_text, filing)
             except Exception as e:
                 if isinstance(e, SecRateLimitError):
                     return _fail_result(acc, "sec_rate_limited")
@@ -1462,14 +1522,21 @@ def process_one_filing(item, mode: str = None):
                 return _fail_result(acc, f"direct_fetch_error:{_fmt_exc(direct_fetch_error)}")
             print(f"    SKIP {acc}: no direct document URL and edgartools unavailable")
             return _skip_result(acc, "no_direct_document_url")
-        if not full_text or len(full_text) < 200:
-            print(f"    SKIP {acc}: text too short ({len(full_text) or 0} chars)")
+        if not full_text:
+            # Zero chars almost always means a transient fetch failure, not a
+            # genuinely empty document. Fail (retried next run) instead of
+            # recording a terminal skip that permanently drops the filing.
+            print(f"    FAIL {acc}: no document text fetched (will retry next run)")
+            return _fail_result(acc, "empty_document_text")
+        if len(full_text) < 200:
+            print(f"    SKIP {acc}: text too short ({len(full_text)} chars)")
             return _skip_result(acc, "text_too_short")
 
         # 2) Multi-fund: also fetch and score individual documents
         fund_docs = []
         if root_form in config.MULTI_FUND_FORMS and filing is not None:
-            fund_docs = extract_fund_documents(filing)
+            with _edgar_gate:
+                fund_docs = extract_fund_documents(filing)
 
         # 3) Run all extraction strategies, get ranked candidates
         candidates = extract_all_candidates(
@@ -1522,6 +1589,10 @@ def process_one_filing(item, mode: str = None):
         # 7) Compose records for the normalized tables
         if not kw:
             kw = _pick_matched_keyword(full_text[:5000])
+        filing_pdf_url = ""
+        if filing is not None:
+            with _edgar_gate:
+                filing_pdf_url = _detect_filing_pdf_url(filing)
         meta = {
             "accession_no": acc,
             "cik": cik,
@@ -1533,7 +1604,7 @@ def process_one_filing(item, mode: str = None):
             "filing_category": filing_cat,
             "tier": tier,
             "sec_url": get_filing_url(cik, acc),
-            "filing_pdf_url": _detect_filing_pdf_url(filing) if filing is not None else "",
+            "filing_pdf_url": filing_pdf_url,
             "crypto_connection": _clean_text(crypto_conn),
             "entity_type": entity_type,
             "purpose": purpose,

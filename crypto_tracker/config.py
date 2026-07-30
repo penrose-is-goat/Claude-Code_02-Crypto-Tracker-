@@ -1,5 +1,15 @@
 """
-Configuration for Crypto SEC Filing Tracker v1.1.35.
+Configuration for Crypto SEC Filing Tracker v1.1.36.
+
+v1.1.36 changes:
+- edgartools fallback is now bounded: low concurrency gate, its own rate
+  limit, longer HTTP/pool timeouts, and retry on transient timeouts.
+  Fixes hour-long runs full of PoolTimeout('') errors when many worker
+  threads piled onto edgartools' shared throttled HTTP client.
+- Empty fetched text (0 chars) is a retryable failure, not a terminal
+  skip — transient network failures no longer permanently drop filings.
+- Missing doc URLs are resolved via the direct archive index before
+  falling back to edgartools, keeping the hot path on plain requests.
 
 v1.1.35 changes:
 - Faster direct SEC submissions discovery for known CIKs
@@ -24,8 +34,8 @@ import os
 from datetime import datetime
 
 # ─── Version ──────────────────────────────────────────────────────────────
-VERSION = "1.1.35"
-VERSION_NAME = "Batch 1 — SEC Filing Tracker (fast exact risk extraction)"
+VERSION = "1.1.36"
+VERSION_NAME = "Batch 1 — SEC Filing Tracker (bounded edgartools fallback)"
 
 # ─── Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +91,18 @@ SEC_MAX_RETRIES = 4
 SEC_BACKOFF_BASE = 2.0
 SEC_BACKOFF_MAX = 60.0
 SEC_429_COOLDOWN = 10.0
+
+# ─── edgartools fallback guard (v1.1.36) ─────────────────────────────────
+# edgartools is only a fallback (no direct doc URL / attachments needed),
+# but its shared httpx client has its own throttle and a short default
+# pool timeout. Unbounded, IO_THREADS workers pile onto it and every call
+# dies with PoolTimeout(''). Bound its concurrency, slow its rate so the
+# combined direct+edgartools request rate stays under SEC's 10/s, and
+# retry transient timeouts instead of dropping the filing.
+EDGARTOOLS_MAX_CONCURRENCY = 2   # Max worker threads inside edgartools at once
+EDGARTOOLS_RATE_LIMIT_PER_SEC = 2  # edgartools' own limiter (EDGAR_RATE_LIMIT_PER_SEC)
+EDGARTOOLS_RETRIES = 2           # Extra attempts on Timeout/PoolTimeout errors
+EDGARTOOLS_RETRY_DELAY = 3.0     # Seconds between fallback retries
 
 # ─── EFTS direct-HTTP search (bypasses edgartools' PoolTimeout) ──────────
 EFTS_URL = "https://efts.sec.gov/LATEST/search-index"

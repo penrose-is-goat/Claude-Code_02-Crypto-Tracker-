@@ -1066,14 +1066,21 @@ def extract_crypto_paragraphs(text: str, max_chars: int = 60000) -> str:
 
 def fetch_filing_text(filing) -> Tuple[str, str]:
     """Get (full_text, raw_html) from a Filing object. Prefer HTML for cleaner
-    structural parsing."""
+    structural parsing.
+
+    Raises the underlying fetch error when BOTH .html() and .text() fail and
+    nothing was retrieved. Silently returning "" here made transient network
+    errors (e.g. PoolTimeout) look like genuinely empty documents, which were
+    then recorded as terminal skips and permanently dropped.
+    """
     full_text = ""
     raw_html = ""
+    fetch_error = None
 
     try:
         raw_html = filing.html() or ""
-    except Exception:
-        pass
+    except Exception as e:
+        fetch_error = e
 
     if raw_html:
         full_text = clean_html_to_text(raw_html)
@@ -1081,8 +1088,11 @@ def fetch_filing_text(filing) -> Tuple[str, str]:
     if not full_text:
         try:
             full_text = filing.text() or ""
-        except Exception:
-            pass
+        except Exception as e:
+            fetch_error = fetch_error or e
+
+    if not full_text and not raw_html and fetch_error is not None:
+        raise fetch_error
 
     return full_text, raw_html
 

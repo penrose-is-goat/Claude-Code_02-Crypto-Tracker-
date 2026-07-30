@@ -1236,6 +1236,98 @@ markets may adversely affect the fund. These risks may be significant.
         finally:
             config.DATA_DIR = old_data_dir
 
+    # ── Test 10: v1.1.36 edgartools fallback hardening ───────────────────
+    print("\n[10] edgartools fallback hardening (v1.1.36)")
+    fake_pool_timeout = type("PoolTimeout", (Exception,), {})
+    test("PoolTimeout-style errors classified as transient",
+         scraper._is_transient_net_error(fake_pool_timeout()) and
+         scraper._is_transient_net_error(TimeoutError("read timed out")) and
+         not scraper._is_transient_net_error(ValueError("bad value")))
+
+    calls = {"n": 0}
+
+    def flaky_then_ok():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise fake_pool_timeout("")
+        return "ok"
+
+    with mock.patch.object(config, "EDGARTOOLS_RETRY_DELAY", 0.0):
+        retried_value = scraper._edgar_call(flaky_then_ok)
+    test("_edgar_call retries transient timeouts then succeeds",
+         retried_value == "ok" and calls["n"] == 3,
+         f"attempts={calls['n']}")
+
+    def always_value_error():
+        raise ValueError("permanent")
+
+    try:
+        scraper._edgar_call(always_value_error)
+        non_transient_raised = False
+    except ValueError:
+        non_transient_raised = True
+    test("_edgar_call does not retry non-transient errors",
+         non_transient_raised)
+
+    class _BrokenFiling:
+        def html(self):
+            raise fake_pool_timeout("")
+
+        def text(self):
+            raise fake_pool_timeout("")
+
+    from crypto_tracker.extractor import fetch_filing_text as _fft
+    try:
+        _fft(_BrokenFiling())
+        raised_on_total_failure = False
+    except Exception:
+        raised_on_total_failure = True
+    test("fetch_filing_text raises when both html() and text() fail",
+         raised_on_total_failure)
+
+    class _TextOnlyFiling:
+        def html(self):
+            raise fake_pool_timeout("")
+
+        def text(self):
+            return "plain filing text body"
+
+    text_only = _fft(_TextOnlyFiling())
+    test("fetch_filing_text still returns text when only html() fails",
+         text_only[0] == "plain filing text body")
+
+    empty_item = (
+        "0000000009-25-000009", "", "Empty Doc Corp", "", "10-K",
+        "10-K", "2025-03-01", 2, "", "", "",
+    )
+    with mock.patch.object(scraper, "HAS_EDGAR", True), \
+         mock.patch.object(scraper, "get_by_accession_number",
+                           create=True, return_value=object()), \
+         mock.patch.object(scraper, "fetch_filing_text", return_value=("", "")):
+        empty_result = scraper.process_one_filing(empty_item, mode="exact_only")
+    test("Empty fetched text is a retryable failure, not a terminal skip",
+         empty_result.get("_status") == "failed" and
+         empty_result.get("reason") == "empty_document_text",
+         f"status={empty_result.get('_status')}, reason={empty_result.get('reason')}")
+
+    resolved_url = "https://www.sec.gov/Archives/edgar/data/123/000000000825000008/main10k.htm"
+    no_doc_item = (
+        "0000000008-25-000008", "123", "Bitcoin Ops Inc", "BTCO", "10-K",
+        "10-K", "2025-03-01", 2, "", "", "",
+    )
+    with mock.patch.object(scraper, "_resolve_primary_doc_url",
+                           return_value=(resolved_url, "main10k.htm")) as resolve_mock, \
+         mock.patch.object(scraper, "fetch_direct_document_text",
+                           return_value=(MOCK_10K, "")) as direct_mock:
+        resolved_result = scraper.process_one_filing(no_doc_item, mode="exact_only")
+    test("Missing doc URL resolved via direct archive index (no edgartools)",
+         resolve_mock.call_count == 1 and
+         direct_mock.call_count == 1 and
+         direct_mock.call_args[0][0] == resolved_url and
+         resolved_result.get("meta") is not None and
+         resolved_result["candidates"][0].get("source_doc_name") == "main10k.htm",
+         f"resolve_calls={resolve_mock.call_count}, direct_calls={direct_mock.call_count}")
+
     # ── Summary ──────────────────────────────────────────────────────────
     passed = sum(1 for _, ok, _ in results if ok)
     failed = sum(1 for _, ok, _ in results if not ok)

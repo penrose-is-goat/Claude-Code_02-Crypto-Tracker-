@@ -125,6 +125,9 @@
     <div class="risk-summary-box">
         {% if filing.risk_summary %}
             {{ filing.risk_summary }}
+        {% elif filing.summary_model and filing.summary_model.startswith('no-summary') %}
+            No summary generated — this section fell below the crypto-relevance
+            threshold. The exact source-backed risk section is still saved below.
         {% else %}
             Analysis pending. The exact source-backed risk section is already saved below.
         {% endif %}

@@ -138,6 +138,9 @@
         <div class="risk-summary-box">
             {% if f.risk_summary %}
             {{ f.risk_summary }}
+            {% elif f.summary_model and f.summary_model.startswith('no-summary') %}
+            No summary generated — this section fell below the crypto-relevance
+            threshold. The exact source-backed risk section is still saved below.
             {% else %}
             Analysis pending. The exact source-backed risk section is already saved below.
             {% endif %}

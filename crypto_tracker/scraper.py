@@ -281,6 +281,7 @@ def _new_run_metrics() -> dict:
             "analysis_cache_hits": 0,
             "analysis_generated": 0,
             "analysis_deferred": 0,
+            "analysis_rejected": 0,
             "db_writes": 0,
             "skip_state_writes": 0,
             "candidate_universe": 0,
@@ -1744,6 +1745,28 @@ def clear_runtime_caches():
 # MAIN DRIVER
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _run_analysis_phase(progress_callback=None, metrics: dict = None) -> int:
+    """Phase 2 of every run: turn saved exact sections into summaries.
+
+    Extraction is network-bound and analysis is CPU-bound, so they stay
+    separate passes — a slow SEC fetch never blocks summarization. But
+    extraction alone leaves every filing reading "Analysis pending", and
+    nothing else in the app triggers analysis, so every run chains it here.
+    Analysis is idempotent: it only touches sections whose summary is
+    missing or whose text hash has changed.
+    """
+    t0 = time.perf_counter()
+    try:
+        count = analyze_pending_sections(progress_callback=progress_callback)
+    except Exception as e:
+        print(f"  Analysis phase error: {_fmt_exc(e)}")
+        _inc_reason("failure_reasons", "analysis_phase_error")
+        count = 0
+    if metrics is not None:
+        metrics["timings"]["analysis_seconds"] = round(time.perf_counter() - t0, 3)
+    return count
+
+
 def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 benchmark: bool = False):
     start_time = time.time()
@@ -1776,6 +1799,9 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 mode="exact_only",
                 progress_callback=progress_callback,
             )
+            # Re-extraction rewrites exact text (and its hash), so summaries
+            # are now stale by definition — analyze before returning.
+            analyzed = _run_analysis_phase(progress_callback, metrics)
             duration = time.time() - start_time
             total_in_db = db.get_filing_count()
             metrics["timings"]["total_seconds"] = round(duration, 3)
@@ -1783,6 +1809,7 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 "new_found": 0, "saved": 0, "failed": 0,
                 "skipped": 0,
                 "reprocessed": count,
+                "analyzed": analyzed,
                 "total_in_db": total_in_db, "duration_seconds": duration,
                 "mode": mode, "scope": scope,
             }, metrics, benchmark=benchmark)
@@ -1798,15 +1825,20 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 if progress_callback:
                     progress_callback(0, existing_count, 0, 0,
                                       message=f"All {existing_count} filings up to date.")
+                # No new filings still leaves any earlier analysis backlog to
+                # clear, so run phase 2 rather than returning immediately.
+                analyzed = _run_analysis_phase(progress_callback, metrics)
                 duration = time.time() - start_time
                 total_in_db = db.get_filing_count()
-                print(f"  No new filings to process. Reprocessing is explicit via /api/reprocess.")
+                print(f"  No new filings to process. Analyzed {analyzed} pending sections.")
+                print(f"  Re-extraction of cached filings is explicit via /api/reprocess.")
                 print(f"  Total with summaries: {total_in_db}")
                 print(f"  Duration: {duration:.0f}s ({duration/60:.1f}min)")
                 return _complete_run({
                     "new_found": 0, "saved": 0, "failed": 0,
                     "skipped": 0,
                     "reprocessed": 0,
+                    "analyzed": analyzed,
                     "total_in_db": total_in_db, "duration_seconds": duration,
                     "mode": mode, "scope": scope,
                 }, metrics, benchmark=benchmark)
@@ -1817,6 +1849,7 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                     "new_found": 0, "saved": 0, "failed": 0,
                     "skipped": 0,
                     "reprocessed": 0,
+                    "analyzed": 0,
                     "total_in_db": 0, "duration_seconds": duration,
                     "mode": mode, "scope": scope,
                 }, metrics, benchmark=benchmark)
@@ -1904,10 +1937,14 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
         metrics["timings"]["process_seconds"] = round(time.perf_counter() - process_t0, 3)
         metrics["timings"]["db_write_seconds"] = round(db_t0, 3)
         db.commit()
+
+        # Phase 2 — summarize what was just extracted (plus any older backlog).
+        analyzed = _run_analysis_phase(progress_callback, metrics)
+
         duration = time.time() - start_time
         metrics["timings"]["total_seconds"] = round(duration, 3)
         total_in_db = db.get_filing_count()
-        print(f"\n  {saved} saved, {failed} failed, {skipped} skipped")
+        print(f"\n  {saved} saved, {failed} failed, {skipped} skipped, {analyzed} analyzed")
         print(f"  Total in database: {total_in_db}")
         print(f"  Duration: {duration:.0f}s ({duration/60:.1f}min)")
         print(f"  Metrics: {metrics['counters']}")
@@ -1922,6 +1959,7 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
             "failed": failed,
             "skipped": skipped,
             "reprocessed": 0,
+            "analyzed": analyzed,
             "total_in_db": total_in_db,
             "duration_seconds": duration,
             "mode": mode,
@@ -1959,14 +1997,25 @@ def analyze_pending_sections(limit: int = None, progress_callback=None) -> int:
     total = len(rows)
     print(f"Analyzing {total} exact risk sections needing summaries...")
     done = 0
+    rejected = 0
     for i, r in enumerate(rows, 1):
         summary_result = build_summary(
             r["text"], form_type=r["form_type"], company_name=r["company_name"],
         )
+        summary_text = summary_result.get("summary", "")
+        summary_model = summary_result.get("model", "")
+        if not summary_text:
+            # build_summary's crypto-relevance gate rejected this section. Mark
+            # the row explicitly: an empty summary with an empty model reads as
+            # "analyzed" to the dashboard while the UI still shows "Analysis
+            # pending", so the filing looks stuck forever with no explanation.
+            summary_model = summary_model or f"no-summary-v{config.VERSION}"
+            rejected += 1
+            _inc_metric("analysis_rejected")
         db.upsert_summary(
             r["accession_no"],
-            summary_result.get("summary", ""),
-            summary_result.get("model", ""),
+            summary_text,
+            summary_model,
             section_id=r["id"],
             text_hash=r["exact_text_hash"],
         )
@@ -1980,7 +2029,8 @@ def analyze_pending_sections(limit: int = None, progress_callback=None) -> int:
                 message=f"Analyzing {i}/{total} exact sections",
             )
     db.commit()
-    print(f"Done. Analyzed {done}/{total} sections.")
+    note = f" ({rejected} below crypto-relevance threshold)" if rejected else ""
+    print(f"Done. Analyzed {done}/{total} sections{note}.")
     return done
 
 

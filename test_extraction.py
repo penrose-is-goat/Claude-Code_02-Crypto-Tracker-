@@ -1227,12 +1227,18 @@ markets may adversely affect the fund. These risks may be significant.
                  mock.patch.object(scraper, "search_edgar_filings", return_value=[]), \
                  mock.patch.object(scraper.db, "get_total_filing_count", return_value=2), \
                  mock.patch.object(scraper.db, "get_filing_count", return_value=2), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=4) as uptodate_analyze_mock, \
                  mock.patch.object(scraper, "reprocess_existing", return_value=99) as reprocess_mock:
                 no_new_result = scraper.run_scraper()
             test("Up-to-date scraper run does not auto-reprocess",
                  reprocess_mock.call_count == 0 and
                  no_new_result["reprocessed"] == 0 and
                  no_new_result["new_found"] == 0)
+            test("Up-to-date run still clears the analysis backlog",
+                 uptodate_analyze_mock.call_count == 1 and
+                 no_new_result["analyzed"] == 4,
+                 f"analyze_calls={uptodate_analyze_mock.call_count}")
         finally:
             config.DATA_DIR = old_data_dir
 
@@ -1327,6 +1333,148 @@ markets may adversely affect the fund. These risks may be significant.
          resolved_result.get("meta") is not None and
          resolved_result["candidates"][0].get("source_doc_name") == "main10k.htm",
          f"resolve_calls={resolve_mock.call_count}, direct_calls={direct_mock.call_count}")
+
+    # ── Test 11: analysis auto-chains as phase 2 (v1.1.36) ───────────────
+    print("\n[11] Analysis phase auto-chaining (v1.1.36)")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_data_dir = config.DATA_DIR
+        try:
+            config.DATA_DIR = tmp
+            chain_todo = [(
+                "0000000010-25-000010", "123", "Chain Co", "CH", "10-K",
+                "10-K", "2025-03-01", 2, "",
+                "https://example.test/doc.htm", "doc.htm",
+            )]
+            skip_result = {
+                "_status": "skipped",
+                "accession_no": "0000000010-25-000010",
+                "reason": "text_too_short",
+            }
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "search_edgar_filings", return_value=chain_todo), \
+                 mock.patch.object(scraper, "process_one_filing", return_value=skip_result), \
+                 mock.patch.object(scraper, "_write_result_batch"), \
+                 mock.patch.object(scraper.db, "commit"), \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=1), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=7) as chain_analyze:
+                chained = scraper.run_scraper()
+            test("Update run chains analysis after extraction",
+                 chain_analyze.call_count == 1 and chained["analyzed"] == 7,
+                 f"analyze_calls={chain_analyze.call_count}, analyzed={chained.get('analyzed')}")
+
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "reprocess_existing", return_value=5) as cached_rp, \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=5), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=5) as cached_analyze:
+                cached = scraper.run_scraper(mode="all_cached")
+            test("Cached re-extract chains analysis (no stale summaries)",
+                 cached_rp.call_count == 1 and
+                 cached_analyze.call_count == 1 and
+                 cached["analyzed"] == 5)
+
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "search_edgar_filings", return_value=chain_todo), \
+                 mock.patch.object(scraper, "process_one_filing", return_value=skip_result), \
+                 mock.patch.object(scraper, "_write_result_batch"), \
+                 mock.patch.object(scraper.db, "commit"), \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=1), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   side_effect=RuntimeError("summarizer exploded")):
+                resilient = scraper.run_scraper()
+            test("Analysis phase failure does not abort the run",
+                 resilient["analyzed"] == 0 and resilient["new_found"] == 1,
+                 f"analyzed={resilient.get('analyzed')}")
+            test("Analysis phase records timing for benchmarking",
+                 "analysis_seconds" in resilient["metrics"]["timings"])
+        finally:
+            config.DATA_DIR = old_data_dir
+
+    # Real analysis over a real extracted section — no mocks, no network, no API key.
+    with tempfile.TemporaryDirectory() as tmp:
+        old_paths = {
+            "DATA_DIR": config.DATA_DIR, "DB_PATH": config.DB_PATH,
+            "TEXT_CACHE_DIR": config.TEXT_CACHE_DIR,
+        }
+        try:
+            config.DATA_DIR = tmp
+            config.DB_PATH = os.path.join(tmp, "t.db")
+            config.TEXT_CACHE_DIR = os.path.join(tmp, "text_cache")
+            from crypto_tracker import database as adb
+            adb._init_done = False
+            if hasattr(adb._local, "conn") and adb._local.conn is not None:
+                adb._local.conn.close()
+                adb._local.conn = None
+            adb.init_db()
+
+            real_raw = load_sec_fixture("coinbase_2024_10k_excerpt.txt")
+            real_sec = extract_exact_risk_sections(real_raw, "10-K")[0]
+            scraper._write_filing_to_db({
+                "meta": {
+                    "accession_no": "0001679788-25-000099", "cik": "1679788",
+                    "company_name": "Coinbase Global Inc", "ticker": "COIN",
+                    "form_type": "10-K", "root_form": "10-K",
+                    "filing_date": "2025-02-15", "filing_category": "Operating Co.",
+                    "tier": 2, "sec_url": "https://sec.gov/x", "filing_pdf_url": "",
+                    "crypto_connection": "Reports bitcoin operations.",
+                    "entity_type": "Exchange", "purpose": "Annual report",
+                    "top_holdings": "BTC", "search_keyword": "bitcoin",
+                    "fetched_at": "2025-02-15T00:00:00",
+                    "processed_at": "2025-02-15T00:00:00",
+                },
+                "fund_docs": [],
+                "candidates": [dict(
+                    real_sec, section_type="risk_factors", title="Risk Factors",
+                    confidence=0.95, source_doc_name="coin-10k.htm",
+                    source_doc_url="https://sec.gov/x.htm", source_hash="a" * 64,
+                )],
+                "summary": "", "summary_model": "deferred",
+                "summary_text_hash": real_sec["exact_text_hash"],
+            })
+            adb.commit()
+
+            pending_before = adb.get_dashboard_stats()["analysis_pending"]
+            analyzed_n = scraper.analyze_pending_sections()
+            stats_after = adb.get_dashboard_stats()
+            saved_row = adb.get_filing_by_accession("0001679788-25-000099")
+
+            test("Deferred extraction leaves the filing analysis-pending",
+                 pending_before == 1, f"pending={pending_before}")
+            test("Analysis generates a real summary with no API key",
+                 analyzed_n == 1 and len(saved_row["risk_summary"]) > 80 and
+                 saved_row["summary_model"].startswith("template-"),
+                 f"model={saved_row['summary_model']!r}, len={len(saved_row['risk_summary'])}")
+            test("Analysis clears the pending counter",
+                 stats_after["analysis_pending"] == 0 and
+                 stats_after["analysis_complete"] == 1)
+            test("Analysis preserves the exact risk section untouched",
+                 saved_row["risk_section"] == real_sec["text"])
+            test("Re-running analysis is idempotent (nothing left pending)",
+                 scraper.analyze_pending_sections() == 0)
+
+            # Quality-gate rejection must not masquerade as a finished analysis.
+            with mock.patch.object(
+                scraper, "build_summary",
+                return_value={"summary": "", "model": "", "purpose": "", "top_holdings": ""},
+            ):
+                adb.get_connection().execute(
+                    "UPDATE filing_summaries SET text_hash = 'stale' WHERE is_current = 1"
+                )
+                adb.commit()
+                scraper.analyze_pending_sections()
+            rejected_row = adb.get_filing_by_accession("0001679788-25-000099")
+            test("Quality-gate rejection is recorded with an explicit model marker",
+                 rejected_row["summary_model"].startswith("no-summary"),
+                 f"model={rejected_row['summary_model']!r}")
+        finally:
+            from crypto_tracker import database as adb
+            if hasattr(adb._local, "conn") and adb._local.conn is not None:
+                adb._local.conn.close()
+                adb._local.conn = None
+            adb._init_done = False
+            for key, value in old_paths.items():
+                setattr(config, key, value)
 
     # ── Summary ──────────────────────────────────────────────────────────
     passed = sum(1 for _, ok, _ in results if ok)

@@ -1,5 +1,11 @@
 """
-SEC EDGAR Scraper v1.1.35.
+SEC EDGAR Scraper v1.1.36.
+
+v1.1.36 changes:
+- edgartools fallback bounded by a concurrency gate + its own low rate
+  limit + longer pool timeout; transient timeouts retried (PoolTimeout fix)
+- Empty fetched text is a retryable failure, never a terminal skip
+- Missing doc URLs resolved via direct archive index before edgartools
 
 v1.1.35 changes:
 - Prefers direct SEC submissions/archive HTTP for faster discovery and fetch
@@ -42,6 +48,15 @@ if config.USE_EDGAR_LOCAL_CACHE:
     os.environ.setdefault("EDGAR_LOCAL_DATA_DIR", config.EDGAR_CACHE_DIR)
     os.environ.setdefault("EDGAR_DATA_DIR", config.EDGAR_CACHE_DIR)
 
+# edgartools runs its own client-side throttle (default 9 req/s). Our direct
+# requests already pace at SEC_TARGET_REQUESTS_PER_SECOND, so left at its
+# default the combined rate can exceed SEC's 10/s and trigger 429 storms.
+# Must be set before `import edgar` — the limiter is built at import time.
+os.environ.setdefault(
+    "EDGAR_RATE_LIMIT_PER_SEC",
+    str(int(getattr(config, "EDGARTOOLS_RATE_LIMIT_PER_SEC", 2))),
+)
+
 try:
     from edgar import set_identity, get_by_accession_number
     HAS_EDGAR = True
@@ -68,12 +83,20 @@ from .extractor import (
     get_filing_url,
     CRYPTO_RE,
 )
-from .summarizer import build_summary
+from .summarizer import build_summary, build_overview, build_whats_new
 
 
 # ─── One-time setup ──────────────────────────────────────────────────────
 if HAS_EDGAR:
     set_identity(config.SEC_IDENTITY)
+    # edgartools' httpx client defaults to a 5s pool timeout. Under load,
+    # waiting for its throttled connection pool routinely exceeds that and
+    # every call dies with PoolTimeout(''). Raise all timeouts to match ours.
+    try:
+        from edgar.httpclient import configure_http
+        configure_http(timeout=float(getattr(config, "HTTP_TIMEOUT", 30)))
+    except Exception:
+        pass  # older edgartools without configure_http — gate still protects us
 
 # Enable edgartools local storage cache (v1.1.27 speed fix).
 # All subsequent Filing.text()/.html()/.attachments calls hit disk after
@@ -93,6 +116,38 @@ elif not HAS_EDGAR:
     print(f"  edgartools unavailable: using direct SEC HTTP where possible ({_label}: {_msg[:120]})")
 
 _lock = threading.RLock()
+
+# Gate around ALL edgartools network calls. edgartools shares one throttled
+# httpx client across threads; letting IO_THREADS workers queue on it is what
+# produced the PoolTimeout('') storms and 0.1 filings/sec in v1.1.34 runs.
+_edgar_gate = threading.BoundedSemaphore(
+    max(1, int(getattr(config, "EDGARTOOLS_MAX_CONCURRENCY", 2)))
+)
+
+
+def _is_transient_net_error(e: Exception) -> bool:
+    name = type(e).__name__
+    return "Timeout" in name or name in (
+        "ConnectError", "ReadError", "RemoteProtocolError", "PoolTimeout",
+    )
+
+
+def _edgar_call(fn, *args, **kwargs):
+    """Run an edgartools call under the concurrency gate, retrying
+    transient timeouts (PoolTimeout/ReadTimeout/...) before giving up."""
+    retries = max(0, int(getattr(config, "EDGARTOOLS_RETRIES", 2)))
+    delay = float(getattr(config, "EDGARTOOLS_RETRY_DELAY", 3.0))
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with _edgar_gate:
+                return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if not _is_transient_net_error(e) or attempt >= retries:
+                raise
+            time.sleep(delay * (attempt + 1))
+    raise last
 
 
 def _candidate_sort_key(c):
@@ -226,6 +281,10 @@ def _new_run_metrics() -> dict:
             "analysis_cache_hits": 0,
             "analysis_generated": 0,
             "analysis_deferred": 0,
+            "analysis_rejected": 0,
+            "raw_source_db_hits": 0,
+            "raw_source_stored": 0,
+            "regenerated": 0,
             "db_writes": 0,
             "skip_state_writes": 0,
             "candidate_universe": 0,
@@ -1031,14 +1090,14 @@ def _fetch_company_filings(cik: str, name: str, ticker: str, category: str,
         return ("lookup_error", name, direct_error, out)
 
     try:
-        company = Company(cik)
+        company = _edgar_call(Company, cik)
     except Exception as e:
         return ("lookup_error", name, _fmt_exc(e), out)
 
     err_forms = []
     for form in forms:
         try:
-            filings = company.get_filings(form=form)
+            filings = _edgar_call(company.get_filings, form=form)
             if filings is None:
                 continue
             count = 0
@@ -1355,6 +1414,13 @@ def fetch_direct_document_text(doc_url: str):
         r = _sec_get(_sec_session, doc_url, timeout=getattr(config, "HTTP_TIMEOUT", 30))
         raw = r.text or ""
         _save_raw_doc_cache(doc_url, raw)
+    return _raw_to_text(raw), raw
+
+
+def _raw_to_text(raw: str) -> str:
+    """Convert raw source (HTML or plain text) to clean text. No network."""
+    if not raw:
+        return ""
     raw_head = raw[:5000].lower()
     if (
         "<html" in raw_head
@@ -1364,8 +1430,8 @@ def fetch_direct_document_text(doc_url: str):
         or re.search(r"<(?:p|div|table|span|font|tr|td|body)\b", raw_head)
     ):
         from .extractor import clean_html_to_text
-        return clean_html_to_text(raw), raw
-    return raw, raw
+        return clean_html_to_text(raw)
+    return raw
 
 
 def _skip_result(accession_no: str, reason: str) -> dict:
@@ -1410,9 +1476,30 @@ def process_one_filing(item, mode: str = None):
         full_text = ""
         direct_fetch_error = None
         current_doc_rank = _candidate_doc_rank(item)[0]
-        should_resolve_primary = (
-            doc_url
-            and (current_doc_rank >= 50 or root_form in config.ETF_FUND_FORMS)
+        # Resolve the primary document via the direct archive index when the
+        # candidate has no doc URL at all (keeps the filing on the direct
+        # requests path instead of the edgartools fallback), or when the URL
+        # we have looks low-quality.
+        # v1.1.37: the DB is the source of truth. If this filing's raw source
+        # is already stored, re-derive everything from it and skip the network
+        # entirely — including the primary-doc index.json lookup below, which
+        # was the last thing keeping "reprocess" from being offline.
+        stored_raw = None
+        if getattr(config, "STORE_RAW_SOURCE_IN_DB", True):
+            try:
+                stored_raw = db.get_raw_source(acc)
+            except Exception:
+                stored_raw = None
+        if stored_raw and stored_raw.get("text"):
+            raw_html = stored_raw["text"]
+            full_text = _raw_to_text(raw_html)
+            doc_url = doc_url or stored_raw.get("doc_url", "")
+            doc_name = doc_name or stored_raw.get("doc_name", "")
+            _inc_metric("raw_source_db_hits")
+
+        should_resolve_primary = (not full_text) and (
+            (not doc_url and cik)
+            or (doc_url and (current_doc_rank >= 50 or root_form in config.ETF_FUND_FORMS))
         )
         if should_resolve_primary:
             try:
@@ -1423,14 +1510,16 @@ def process_one_filing(item, mode: str = None):
                 )
                 replacement_rank = _candidate_doc_rank(replacement)[0]
                 if primary_url and (
-                    replacement_rank < current_doc_rank
+                    not doc_url
+                    or replacement_rank < current_doc_rank
                     or (replacement_rank == current_doc_rank and primary_url != doc_url)
                 ):
                     doc_url = primary_url
                     doc_name = primary_name
             except Exception as e:
                 print(f"    primary doc lookup fallback {acc}: {_fmt_exc(e)}")
-        if doc_url:
+
+        if not full_text and doc_url:
             try:
                 full_text, raw_html = fetch_direct_document_text(doc_url)
             except Exception as e:
@@ -1439,7 +1528,7 @@ def process_one_filing(item, mode: str = None):
 
         if not full_text and HAS_EDGAR:
             try:
-                filing = get_by_accession_number(acc)
+                filing = _edgar_call(get_by_accession_number, acc)
             except Exception as e:
                 if isinstance(e, SecRateLimitError):
                     return _fail_result(acc, "sec_rate_limited")
@@ -1450,7 +1539,7 @@ def process_one_filing(item, mode: str = None):
 
             # 1) Fetch text + html (cached locally by edgartools on first run)
             try:
-                full_text, raw_html = fetch_filing_text(filing)
+                full_text, raw_html = _edgar_call(fetch_filing_text, filing)
             except Exception as e:
                 if isinstance(e, SecRateLimitError):
                     return _fail_result(acc, "sec_rate_limited")
@@ -1462,14 +1551,21 @@ def process_one_filing(item, mode: str = None):
                 return _fail_result(acc, f"direct_fetch_error:{_fmt_exc(direct_fetch_error)}")
             print(f"    SKIP {acc}: no direct document URL and edgartools unavailable")
             return _skip_result(acc, "no_direct_document_url")
-        if not full_text or len(full_text) < 200:
-            print(f"    SKIP {acc}: text too short ({len(full_text) or 0} chars)")
+        if not full_text:
+            # Zero chars almost always means a transient fetch failure, not a
+            # genuinely empty document. Fail (retried next run) instead of
+            # recording a terminal skip that permanently drops the filing.
+            print(f"    FAIL {acc}: no document text fetched (will retry next run)")
+            return _fail_result(acc, "empty_document_text")
+        if len(full_text) < 200:
+            print(f"    SKIP {acc}: text too short ({len(full_text)} chars)")
             return _skip_result(acc, "text_too_short")
 
         # 2) Multi-fund: also fetch and score individual documents
         fund_docs = []
         if root_form in config.MULTI_FUND_FORMS and filing is not None:
-            fund_docs = extract_fund_documents(filing)
+            with _edgar_gate:
+                fund_docs = extract_fund_documents(filing)
 
         # 3) Run all extraction strategies, get ranked candidates
         candidates = extract_all_candidates(
@@ -1522,6 +1618,10 @@ def process_one_filing(item, mode: str = None):
         # 7) Compose records for the normalized tables
         if not kw:
             kw = _pick_matched_keyword(full_text[:5000])
+        filing_pdf_url = ""
+        if filing is not None:
+            with _edgar_gate:
+                filing_pdf_url = _detect_filing_pdf_url(filing)
         meta = {
             "accession_no": acc,
             "cik": cik,
@@ -1533,7 +1633,7 @@ def process_one_filing(item, mode: str = None):
             "filing_category": filing_cat,
             "tier": tier,
             "sec_url": get_filing_url(cik, acc),
-            "filing_pdf_url": _detect_filing_pdf_url(filing) if filing is not None else "",
+            "filing_pdf_url": filing_pdf_url,
             "crypto_connection": _clean_text(crypto_conn),
             "entity_type": entity_type,
             "purpose": purpose,
@@ -1550,6 +1650,12 @@ def process_one_filing(item, mode: str = None):
             "summary": summary_result.get("summary", ""),
             "summary_model": summary_result.get("model", ""),
             "summary_text_hash": primary_hash,
+            # Carried so the DB write can persist the source durably. Only set
+            # when freshly fetched — a filing re-derived from stored source
+            # doesn't need rewriting.
+            "raw_source": "" if stored_raw else (raw_html or ""),
+            "raw_source_url": doc_url,
+            "raw_source_name": doc_name,
         }
 
     except Exception as e:
@@ -1569,6 +1675,26 @@ def _write_filing_to_db_unlocked(record):
     acc = meta["accession_no"]
 
     db.upsert_filing(meta)
+
+    # v1.1.37: persist raw source durably so this filing can be re-extracted
+    # offline forever after. Skipped when it was re-derived from stored source.
+    raw_source = record.get("raw_source") or ""
+    if raw_source:
+        try:
+            if db.save_raw_source(
+                acc, raw_source,
+                doc_url=record.get("raw_source_url", ""),
+                doc_name=record.get("raw_source_name", ""),
+            ):
+                _inc_metric("raw_source_stored")
+        except Exception as e:
+            print(f"    raw source store skipped {acc}: {_fmt_exc(e)}")
+
+    db.set_extraction_version(
+        acc,
+        getattr(config, "EXTRACTION_VERSION", config.VERSION),
+        getattr(config, "PROCESSOR_VERSION", config.VERSION),
+    )
 
     # Documents (multi-fund scoring info — optional)
     if record["fund_docs"]:
@@ -1673,6 +1799,201 @@ def clear_runtime_caches():
 # MAIN DRIVER
 # ═══════════════════════════════════════════════════════════════════════════
 
+def regenerate_stale_extractions(limit: int = None, progress_callback=None,
+                                 allow_network: bool = None) -> dict:
+    """Re-derive filings whose stored extraction predates EXTRACTION_VERSION.
+
+    This is the "new version, better net" path. Because raw source lives in
+    the DB, a filing is rebuilt with the current extractor using zero SEC
+    traffic. Filings whose stored output is already current are left
+    untouched, so old data only changes where the new extractor actually
+    produces something different.
+
+    Returns counts; never raises for individual filing failures.
+    """
+    db.init_db()
+    target_version = getattr(config, "EXTRACTION_VERSION", config.VERSION)
+    if allow_network is None:
+        allow_network = bool(getattr(config, "REGENERATE_ALLOW_NETWORK", False))
+    if limit is None:
+        limit = int(getattr(config, "REGENERATE_BATCH_LIMIT", 0) or 0)
+
+    rows = db.get_stale_extraction_filings(
+        target_version, limit=limit, require_raw_source=not allow_network,
+    )
+    total = len(rows)
+    if not total:
+        return {"total": 0, "rebuilt": 0, "unchanged": 0, "failed": 0, "no_source": 0}
+
+    stats = db.get_raw_source_stats()
+    print(f"\n  Regenerating {total} filings to extraction {target_version}")
+    print(f"  Raw source in DB: {stats['with_raw_source']}/{stats['total_filings']} filings "
+          f"({stats['stored_bytes'] / 1e6:.0f} MB stored, "
+          f"{stats['raw_bytes'] / 1e6:.0f} MB raw)")
+    if not allow_network:
+        print(f"  Offline mode — no SEC requests will be made")
+
+    rebuilt = failed = no_source = 0
+    for i, r in enumerate(rows, 1):
+        acc = r["accession_no"]
+        if not allow_network and not db.has_raw_source(acc):
+            no_source += 1
+            continue
+        item = (
+            acc, r["cik"], r["company_name"], r["ticker"], r["form_type"],
+            r["root_form"], r["filing_date"], r["tier"], r["search_keyword"],
+            r["source_doc_url"], r["source_doc_name"],
+        )
+        try:
+            result = process_one_filing(item, mode="exact_only")
+        except Exception as e:
+            failed += 1
+            _inc_reason("failure_reasons", f"regenerate_error:{_fmt_exc(e)}")
+            continue
+
+        if result and result.get("meta"):
+            try:
+                _write_filing_to_db(result)
+                rebuilt += 1
+                _inc_metric("regenerated")
+            except Exception as e:
+                failed += 1
+                print(f"    regenerate write error {acc}: {_fmt_exc(e)}")
+        else:
+            # Extraction produced nothing usable. Leave the existing (older)
+            # data in place rather than destroying good data with a worse
+            # result, but stamp it so we don't retry it every single run.
+            failed += 1
+            reason = (result or {}).get("reason", "no_result")
+            _inc_reason("failure_reasons", f"regenerate_no_candidates:{reason}")
+            db.set_extraction_version(
+                acc, target_version,
+                getattr(config, "PROCESSOR_VERSION", config.VERSION),
+            )
+
+        if rebuilt and rebuilt % max(1, int(getattr(config, "DB_BATCH_SIZE", 50))) == 0:
+            db.commit()
+        if progress_callback:
+            progress_callback(
+                i, total, rebuilt, failed,
+                message=f"Regenerating {i}/{total} (rebuilt: {rebuilt})",
+            )
+    db.commit()
+    print(f"  Regenerated {rebuilt}/{total} ({failed} failed, {no_source} without stored source)")
+    return {
+        "total": total, "rebuilt": rebuilt, "failed": failed,
+        "no_source": no_source, "unchanged": 0,
+    }
+
+
+def backfill_raw_source(limit: int = None, progress_callback=None) -> dict:
+    """Populate durable raw source for filings stored before v1.1.37.
+
+    One-time catch-up: filings processed by older versions have no raw source
+    in the DB, so they cannot be regenerated offline. This fetches from the
+    local read-through cache when possible and only reaches SEC when it must.
+    """
+    db.init_db()
+    conn = db.get_connection()
+    query = """
+        SELECT f.accession_no, f.cik, f.root_form,
+               COALESCE(sec.source_doc_url, '') AS source_doc_url,
+               COALESCE(sec.source_doc_name, '') AS source_doc_name
+        FROM filings f
+        LEFT JOIN filing_sections sec
+          ON sec.accession_no = f.accession_no AND sec.is_primary = 1
+        WHERE NOT EXISTS (
+            SELECT 1 FROM filing_raw_source r WHERE r.accession_no = f.accession_no
+        )
+        ORDER BY f.filing_date DESC
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    rows = conn.execute(query).fetchall()
+    total = len(rows)
+    print(f"\n  Backfilling durable raw source for {total} filings")
+
+    stored = from_cache = failed = 0
+    for i, r in enumerate(rows, 1):
+        acc = r["accession_no"]
+        doc_url = r["source_doc_url"]
+        try:
+            raw = _load_raw_doc_cache(doc_url) if doc_url else None
+            if raw is not None:
+                from_cache += 1
+            else:
+                if not doc_url:
+                    doc_url, _name = _resolve_primary_doc_url(
+                        r["cik"], acc, r["root_form"],
+                    )
+                if not doc_url:
+                    failed += 1
+                    continue
+                resp = _sec_get(
+                    _sec_session, doc_url,
+                    timeout=getattr(config, "HTTP_TIMEOUT", 30),
+                )
+                raw = resp.text or ""
+                _save_raw_doc_cache(doc_url, raw)
+            if raw and db.save_raw_source(
+                acc, raw, doc_url=doc_url, doc_name=r["source_doc_name"],
+            ):
+                stored += 1
+        except Exception as e:
+            failed += 1
+            print(f"    backfill failed {acc}: {_fmt_exc(e)}")
+        if stored and stored % 50 == 0:
+            db.commit()
+        if progress_callback:
+            progress_callback(
+                i, total, stored, failed,
+                message=f"Backfilling raw source {i}/{total} (stored: {stored})",
+            )
+    db.commit()
+    print(f"  Stored {stored}/{total} ({from_cache} from local cache, {failed} failed)")
+    return {"total": total, "stored": stored, "from_cache": from_cache, "failed": failed}
+
+
+def _run_regeneration_phase(progress_callback=None, metrics: dict = None) -> dict:
+    """Phase 2 of an update: rebuild filings an improved extractor would change.
+
+    Runs offline against raw source stored in the DB. Contained like the
+    analysis phase — a failure here must not lose the run's extraction work.
+    """
+    t0 = time.perf_counter()
+    try:
+        result = regenerate_stale_extractions(progress_callback=progress_callback)
+    except Exception as e:
+        print(f"  Regeneration phase error: {_fmt_exc(e)}")
+        _inc_reason("failure_reasons", "regeneration_phase_error")
+        result = {"total": 0, "rebuilt": 0, "failed": 0, "no_source": 0}
+    if metrics is not None:
+        metrics["timings"]["regenerate_seconds"] = round(time.perf_counter() - t0, 3)
+    return result
+
+
+def _run_analysis_phase(progress_callback=None, metrics: dict = None) -> int:
+    """Phase 3 of every run: turn saved exact sections into summaries.
+
+    Extraction is network-bound and analysis is CPU-bound, so they stay
+    separate passes — a slow SEC fetch never blocks summarization. But
+    extraction alone leaves every filing reading "Analysis pending", and
+    nothing else in the app triggers analysis, so every run chains it here.
+    Analysis is idempotent: it only touches sections whose summary is
+    missing or whose text hash has changed.
+    """
+    t0 = time.perf_counter()
+    try:
+        count = analyze_pending_sections(progress_callback=progress_callback)
+    except Exception as e:
+        print(f"  Analysis phase error: {_fmt_exc(e)}")
+        _inc_reason("failure_reasons", "analysis_phase_error")
+        count = 0
+    if metrics is not None:
+        metrics["timings"]["analysis_seconds"] = round(time.perf_counter() - t0, 3)
+    return count
+
+
 def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 benchmark: bool = False):
     start_time = time.time()
@@ -1698,6 +2019,35 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 "mode": mode, "scope": scope,
             }, metrics, benchmark=benchmark)
 
+        if mode == "backfill_source":
+            # One-time catch-up so filings stored by older versions become
+            # offline-regenerable. This is the only mode that deliberately
+            # reaches SEC for filings already in the database.
+            back = backfill_raw_source(progress_callback=progress_callback)
+            duration = time.time() - start_time
+            metrics["timings"]["total_seconds"] = round(duration, 3)
+            return _complete_run({
+                "new_found": 0, "saved": 0, "failed": back.get("failed", 0),
+                "skipped": 0, "reprocessed": back.get("stored", 0),
+                "analyzed": 0, "regenerated": 0,
+                "raw_source_stored": back.get("stored", 0),
+                "total_in_db": db.get_filing_count(), "duration_seconds": duration,
+                "mode": mode, "scope": scope,
+            }, metrics, benchmark=benchmark)
+
+        if mode == "regenerate":
+            regen = _run_regeneration_phase(progress_callback, metrics)
+            analyzed = _run_analysis_phase(progress_callback, metrics)
+            duration = time.time() - start_time
+            metrics["timings"]["total_seconds"] = round(duration, 3)
+            return _complete_run({
+                "new_found": 0, "saved": 0, "failed": regen.get("failed", 0),
+                "skipped": regen.get("no_source", 0), "reprocessed": 0,
+                "analyzed": analyzed, "regenerated": regen.get("rebuilt", 0),
+                "total_in_db": db.get_filing_count(), "duration_seconds": duration,
+                "mode": mode, "scope": scope,
+            }, metrics, benchmark=benchmark)
+
         if mode in ("low_confidence_only", "all_cached"):
             count = reprocess_existing(
                 only_low_confidence=(mode == "low_confidence_only"),
@@ -1705,6 +2055,9 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 mode="exact_only",
                 progress_callback=progress_callback,
             )
+            # Re-extraction rewrites exact text (and its hash), so summaries
+            # are now stale by definition — analyze before returning.
+            analyzed = _run_analysis_phase(progress_callback, metrics)
             duration = time.time() - start_time
             total_in_db = db.get_filing_count()
             metrics["timings"]["total_seconds"] = round(duration, 3)
@@ -1712,6 +2065,7 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 "new_found": 0, "saved": 0, "failed": 0,
                 "skipped": 0,
                 "reprocessed": count,
+                "analyzed": analyzed,
                 "total_in_db": total_in_db, "duration_seconds": duration,
                 "mode": mode, "scope": scope,
             }, metrics, benchmark=benchmark)
@@ -1727,15 +2081,24 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                 if progress_callback:
                     progress_callback(0, existing_count, 0, 0,
                                       message=f"All {existing_count} filings up to date.")
+                # No new filings still leaves regeneration and analysis work,
+                # so run those phases rather than returning immediately. This
+                # is how a version upgrade improves existing data.
+                regen = _run_regeneration_phase(progress_callback, metrics)
+                analyzed = _run_analysis_phase(progress_callback, metrics)
                 duration = time.time() - start_time
                 total_in_db = db.get_filing_count()
-                print(f"  No new filings to process. Reprocessing is explicit via /api/reprocess.")
+                print(f"  No new filings. Regenerated {regen.get('rebuilt', 0)}, "
+                      f"analyzed {analyzed} pending sections.")
+                print(f"  Re-extraction of cached filings is explicit via /api/reprocess.")
                 print(f"  Total with summaries: {total_in_db}")
                 print(f"  Duration: {duration:.0f}s ({duration/60:.1f}min)")
                 return _complete_run({
                     "new_found": 0, "saved": 0, "failed": 0,
                     "skipped": 0,
                     "reprocessed": 0,
+                    "analyzed": analyzed,
+                    "regenerated": regen.get("rebuilt", 0),
                     "total_in_db": total_in_db, "duration_seconds": duration,
                     "mode": mode, "scope": scope,
                 }, metrics, benchmark=benchmark)
@@ -1746,6 +2109,7 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
                     "new_found": 0, "saved": 0, "failed": 0,
                     "skipped": 0,
                     "reprocessed": 0,
+                    "analyzed": 0,
                     "total_in_db": 0, "duration_seconds": duration,
                     "mode": mode, "scope": scope,
                 }, metrics, benchmark=benchmark)
@@ -1833,10 +2197,19 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
         metrics["timings"]["process_seconds"] = round(time.perf_counter() - process_t0, 3)
         metrics["timings"]["db_write_seconds"] = round(db_t0, 3)
         db.commit()
+
+        # Phase 2 — rebuild older filings this version extracts better, from
+        # raw source already in the DB (no SEC traffic).
+        regen = _run_regeneration_phase(progress_callback, metrics)
+
+        # Phase 3 — summarize what was just extracted (plus any older backlog).
+        analyzed = _run_analysis_phase(progress_callback, metrics)
+
         duration = time.time() - start_time
         metrics["timings"]["total_seconds"] = round(duration, 3)
         total_in_db = db.get_filing_count()
-        print(f"\n  {saved} saved, {failed} failed, {skipped} skipped")
+        print(f"\n  {saved} saved, {failed} failed, {skipped} skipped, "
+              f"{regen.get('rebuilt', 0)} regenerated, {analyzed} analyzed")
         print(f"  Total in database: {total_in_db}")
         print(f"  Duration: {duration:.0f}s ({duration/60:.1f}min)")
         print(f"  Metrics: {metrics['counters']}")
@@ -1851,6 +2224,8 @@ def run_scraper(progress_callback=None, mode: str = None, scope: str = None,
             "failed": failed,
             "skipped": skipped,
             "reprocessed": 0,
+            "analyzed": analyzed,
+            "regenerated": regen.get("rebuilt", 0),
             "total_in_db": total_in_db,
             "duration_seconds": duration,
             "mode": mode,
@@ -1872,14 +2247,17 @@ def analyze_pending_sections(limit: int = None, progress_callback=None) -> int:
     conn = db.get_connection()
     query = """
         SELECT sec.id, sec.accession_no, sec.text, sec.exact_text_hash,
-               f.form_type, f.company_name
+               f.form_type, f.company_name, f.ticker, f.cik, f.root_form,
+               f.filing_date, f.entity_type
         FROM filing_sections sec
         JOIN filings f ON f.accession_no = sec.accession_no
         LEFT JOIN filing_summaries sm
           ON sm.accession_no = sec.accession_no AND sm.is_current = 1
         WHERE sec.is_primary = 1
           AND sec.text != ''
-          AND (sm.id IS NULL OR COALESCE(sm.text_hash, '') != COALESCE(sec.exact_text_hash, ''))
+          AND (sm.id IS NULL
+               OR COALESCE(sm.text_hash, '') != COALESCE(sec.exact_text_hash, '')
+               OR COALESCE(sm.overview, '') = '')
         ORDER BY f.filing_date DESC
     """
     if limit:
@@ -1888,16 +2266,52 @@ def analyze_pending_sections(limit: int = None, progress_callback=None) -> int:
     total = len(rows)
     print(f"Analyzing {total} exact risk sections needing summaries...")
     done = 0
+    rejected = 0
     for i, r in enumerate(rows, 1):
         summary_result = build_summary(
             r["text"], form_type=r["form_type"], company_name=r["company_name"],
         )
+        summary_text = summary_result.get("summary", "")
+        summary_model = summary_result.get("model", "")
+
+        # v1.1.37: plain-English overview + a diff against this filer's prior
+        # filing of the same form. Both are derived from data already in the
+        # DB, so they cost no network and no API call.
+        overview = ""
+        whats_new = ""
+        try:
+            overview = build_overview(
+                r["text"], form_type=r["form_type"], company_name=r["company_name"],
+                ticker=r["ticker"] or "", entity_type=r["entity_type"] or "",
+            )
+            prior = db.get_prior_filing_section(
+                r["cik"], r["root_form"], r["filing_date"],
+                exclude_accession=r["accession_no"],
+            )
+            if prior:
+                whats_new = build_whats_new(
+                    r["text"], prior["text"], form_type=r["form_type"],
+                    prior_form_type=prior["form_type"], prior_date=prior["filing_date"],
+                )
+        except Exception as e:
+            print(f"    overview/whats-new skipped {r['accession_no']}: {_fmt_exc(e)}")
+
+        if not summary_text:
+            # build_summary's crypto-relevance gate rejected this section. Mark
+            # the row explicitly: an empty summary with an empty model reads as
+            # "analyzed" to the dashboard while the UI still shows "Analysis
+            # pending", so the filing looks stuck forever with no explanation.
+            summary_model = summary_model or f"no-summary-v{config.VERSION}"
+            rejected += 1
+            _inc_metric("analysis_rejected")
         db.upsert_summary(
             r["accession_no"],
-            summary_result.get("summary", ""),
-            summary_result.get("model", ""),
+            summary_text,
+            summary_model,
             section_id=r["id"],
             text_hash=r["exact_text_hash"],
+            overview=overview,
+            whats_new=whats_new,
         )
         _inc_metric("analysis_generated")
         done += 1
@@ -1909,7 +2323,8 @@ def analyze_pending_sections(limit: int = None, progress_callback=None) -> int:
                 message=f"Analyzing {i}/{total} exact sections",
             )
     db.commit()
-    print(f"Done. Analyzed {done}/{total} sections.")
+    note = f" ({rejected} below crypto-relevance threshold)" if rejected else ""
+    print(f"Done. Analyzed {done}/{total} sections{note}.")
     return done
 
 

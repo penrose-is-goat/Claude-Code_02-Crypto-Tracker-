@@ -163,6 +163,7 @@ def settings_page():
         config=config,
         scraper_status=_scraper_status,
         db_count=db.get_filing_count(),
+        raw_source=db.get_raw_source_stats(),
         now=datetime.now(),
     )
 
@@ -279,17 +280,21 @@ def api_start_scraper():
                 counters = metrics.get("counters", {})
                 _scraper_status["metrics"] = metrics
                 reprocessed = result.get("reprocessed", 0)
+                analyzed = result.get("analyzed", 0)
                 if reprocessed > 0:
                     _scraper_status["message"] = (
                         f"Done: reprocessed {reprocessed} cached filings, "
+                        f"{analyzed} analyzed, "
                         f"{result['total_in_db']} exact sections stored "
                         f"({result['duration_seconds']/60:.1f}min)"
                     )
                 elif result["new_found"] == 0 and result["total_in_db"] > 0:
                     fixed = "fixed point, " if counters.get("fixed_point_complete") else ""
+                    analyzed_note = f"{analyzed} newly analyzed, " if analyzed else ""
                     _scraper_status["message"] = (
-                        f"Up to date: {fixed}{result['total_in_db']} exact sections "
-                        f"already stored ({result['duration_seconds']/60:.1f}min)"
+                        f"Up to date: {fixed}{analyzed_note}{result['total_in_db']} "
+                        f"exact sections already stored "
+                        f"({result['duration_seconds']/60:.1f}min)"
                     )
                 elif result["new_found"] == 0 and result["total_in_db"] == 0:
                     _scraper_status["message"] = (
@@ -297,10 +302,9 @@ def api_start_scraper():
                     )
                 else:
                     _scraper_status["skipped"] = result.get("skipped", 0)
-                    deferred = counters.get("analysis_deferred", 0)
                     _scraper_status["message"] = (
                         f"Done: {result['saved']} exact risk sections saved, "
-                        f"{deferred} analyses deferred, {result['failed']} failed, "
+                        f"{analyzed} analyzed, {result['failed']} failed, "
                         f"{result.get('skipped', 0)} skipped, "
                         f"{result['total_in_db']} total exact sections "
                         f"({result['duration_seconds']/60:.1f}min)"
@@ -340,24 +344,62 @@ def api_reprocess():
 
     only_low = request.args.get("only_low_confidence", "0") == "1"
     mode = request.args.get("mode", "all_cached")
-    if mode not in {"analysis_only", "low_confidence_only", "all_cached"}:
+    if mode not in {"analysis_only", "low_confidence_only", "all_cached",
+                    "backfill_source", "regenerate"}:
         return jsonify({"error": f"Invalid reprocess mode: {mode}"}), 400
     limit = request.args.get("limit", type=int)
 
     def _run():
         try:
+            from .scraper import (
+                analyze_pending_sections, backfill_raw_source,
+                regenerate_stale_extractions,
+            )
             if mode == "analysis_only":
-                from .scraper import analyze_pending_sections
-                n = analyze_pending_sections(limit=limit)
+                n = analyze_pending_sections(
+                    limit=limit, progress_callback=_scraper_progress,
+                )
+                message = f"Analyzed {n} pending sections"
+            elif mode == "backfill_source":
+                # One-time: give older filings durable raw source so they
+                # become offline-regenerable from here on.
+                back = backfill_raw_source(
+                    limit=limit, progress_callback=_scraper_progress,
+                )
+                message = (
+                    f"Stored raw source for {back['stored']}/{back['total']} filings "
+                    f"({back['from_cache']} from local cache, {back['failed']} failed)"
+                )
+            elif mode == "regenerate":
+                regen = regenerate_stale_extractions(
+                    limit=limit, progress_callback=_scraper_progress,
+                )
+                analyzed = analyze_pending_sections(
+                    progress_callback=_scraper_progress,
+                )
+                message = (
+                    f"Regenerated {regen['rebuilt']}/{regen['total']} filings offline, "
+                    f"analyzed {analyzed}"
+                    + (f" ({regen['no_source']} lack stored source — run Backfill first)"
+                       if regen.get("no_source") else "")
+                )
             else:
                 n = reprocess_existing(
                     limit=limit,
                     only_low_confidence=only_low or mode == "low_confidence_only",
                     all_cached=mode == "all_cached",
                     mode="exact_only",
+                    progress_callback=_scraper_progress,
                 )
+                # Re-extraction rewrites each section's exact text and hash, so
+                # every summary it touched is now stale. Analyze before
+                # reporting done, or the filings sit at "Analysis pending".
+                analyzed = analyze_pending_sections(
+                    progress_callback=_scraper_progress,
+                )
+                message = f"Reprocessed {n} cached filings, analyzed {analyzed}"
             with _scraper_lock:
-                _scraper_status["message"] = f"Reprocessed {n} cached filings"
+                _scraper_status["message"] = message
                 _scraper_status["last_run"] = datetime.now().isoformat()
         except Exception as e:
             with _scraper_lock:

@@ -1227,14 +1227,392 @@ markets may adversely affect the fund. These risks may be significant.
                  mock.patch.object(scraper, "search_edgar_filings", return_value=[]), \
                  mock.patch.object(scraper.db, "get_total_filing_count", return_value=2), \
                  mock.patch.object(scraper.db, "get_filing_count", return_value=2), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=4) as uptodate_analyze_mock, \
                  mock.patch.object(scraper, "reprocess_existing", return_value=99) as reprocess_mock:
                 no_new_result = scraper.run_scraper()
             test("Up-to-date scraper run does not auto-reprocess",
                  reprocess_mock.call_count == 0 and
                  no_new_result["reprocessed"] == 0 and
                  no_new_result["new_found"] == 0)
+            test("Up-to-date run still clears the analysis backlog",
+                 uptodate_analyze_mock.call_count == 1 and
+                 no_new_result["analyzed"] == 4,
+                 f"analyze_calls={uptodate_analyze_mock.call_count}")
         finally:
             config.DATA_DIR = old_data_dir
+
+    # ── Test 10: v1.1.36 edgartools fallback hardening ───────────────────
+    print("\n[10] edgartools fallback hardening (v1.1.36)")
+    fake_pool_timeout = type("PoolTimeout", (Exception,), {})
+    test("PoolTimeout-style errors classified as transient",
+         scraper._is_transient_net_error(fake_pool_timeout()) and
+         scraper._is_transient_net_error(TimeoutError("read timed out")) and
+         not scraper._is_transient_net_error(ValueError("bad value")))
+
+    calls = {"n": 0}
+
+    def flaky_then_ok():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise fake_pool_timeout("")
+        return "ok"
+
+    with mock.patch.object(config, "EDGARTOOLS_RETRY_DELAY", 0.0):
+        retried_value = scraper._edgar_call(flaky_then_ok)
+    test("_edgar_call retries transient timeouts then succeeds",
+         retried_value == "ok" and calls["n"] == 3,
+         f"attempts={calls['n']}")
+
+    def always_value_error():
+        raise ValueError("permanent")
+
+    try:
+        scraper._edgar_call(always_value_error)
+        non_transient_raised = False
+    except ValueError:
+        non_transient_raised = True
+    test("_edgar_call does not retry non-transient errors",
+         non_transient_raised)
+
+    class _BrokenFiling:
+        def html(self):
+            raise fake_pool_timeout("")
+
+        def text(self):
+            raise fake_pool_timeout("")
+
+    from crypto_tracker.extractor import fetch_filing_text as _fft
+    try:
+        _fft(_BrokenFiling())
+        raised_on_total_failure = False
+    except Exception:
+        raised_on_total_failure = True
+    test("fetch_filing_text raises when both html() and text() fail",
+         raised_on_total_failure)
+
+    class _TextOnlyFiling:
+        def html(self):
+            raise fake_pool_timeout("")
+
+        def text(self):
+            return "plain filing text body"
+
+    text_only = _fft(_TextOnlyFiling())
+    test("fetch_filing_text still returns text when only html() fails",
+         text_only[0] == "plain filing text body")
+
+    empty_item = (
+        "0000000009-25-000009", "", "Empty Doc Corp", "", "10-K",
+        "10-K", "2025-03-01", 2, "", "", "",
+    )
+    with mock.patch.object(scraper, "HAS_EDGAR", True), \
+         mock.patch.object(scraper, "get_by_accession_number",
+                           create=True, return_value=object()), \
+         mock.patch.object(scraper, "fetch_filing_text", return_value=("", "")):
+        empty_result = scraper.process_one_filing(empty_item, mode="exact_only")
+    test("Empty fetched text is a retryable failure, not a terminal skip",
+         empty_result.get("_status") == "failed" and
+         empty_result.get("reason") == "empty_document_text",
+         f"status={empty_result.get('_status')}, reason={empty_result.get('reason')}")
+
+    resolved_url = "https://www.sec.gov/Archives/edgar/data/123/000000000825000008/main10k.htm"
+    no_doc_item = (
+        "0000000008-25-000008", "123", "Bitcoin Ops Inc", "BTCO", "10-K",
+        "10-K", "2025-03-01", 2, "", "", "",
+    )
+    with mock.patch.object(scraper, "_resolve_primary_doc_url",
+                           return_value=(resolved_url, "main10k.htm")) as resolve_mock, \
+         mock.patch.object(scraper, "fetch_direct_document_text",
+                           return_value=(MOCK_10K, "")) as direct_mock:
+        resolved_result = scraper.process_one_filing(no_doc_item, mode="exact_only")
+    test("Missing doc URL resolved via direct archive index (no edgartools)",
+         resolve_mock.call_count == 1 and
+         direct_mock.call_count == 1 and
+         direct_mock.call_args[0][0] == resolved_url and
+         resolved_result.get("meta") is not None and
+         resolved_result["candidates"][0].get("source_doc_name") == "main10k.htm",
+         f"resolve_calls={resolve_mock.call_count}, direct_calls={direct_mock.call_count}")
+
+    # ── Test 11: analysis auto-chains as phase 2 (v1.1.36) ───────────────
+    print("\n[11] Analysis phase auto-chaining (v1.1.36)")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_data_dir = config.DATA_DIR
+        try:
+            config.DATA_DIR = tmp
+            chain_todo = [(
+                "0000000010-25-000010", "123", "Chain Co", "CH", "10-K",
+                "10-K", "2025-03-01", 2, "",
+                "https://example.test/doc.htm", "doc.htm",
+            )]
+            skip_result = {
+                "_status": "skipped",
+                "accession_no": "0000000010-25-000010",
+                "reason": "text_too_short",
+            }
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "search_edgar_filings", return_value=chain_todo), \
+                 mock.patch.object(scraper, "process_one_filing", return_value=skip_result), \
+                 mock.patch.object(scraper, "_write_result_batch"), \
+                 mock.patch.object(scraper.db, "commit"), \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=1), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=7) as chain_analyze:
+                chained = scraper.run_scraper()
+            test("Update run chains analysis after extraction",
+                 chain_analyze.call_count == 1 and chained["analyzed"] == 7,
+                 f"analyze_calls={chain_analyze.call_count}, analyzed={chained.get('analyzed')}")
+
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "reprocess_existing", return_value=5) as cached_rp, \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=5), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   return_value=5) as cached_analyze:
+                cached = scraper.run_scraper(mode="all_cached")
+            test("Cached re-extract chains analysis (no stale summaries)",
+                 cached_rp.call_count == 1 and
+                 cached_analyze.call_count == 1 and
+                 cached["analyzed"] == 5)
+
+            with mock.patch.object(scraper.db, "init_db"), \
+                 mock.patch.object(scraper, "search_edgar_filings", return_value=chain_todo), \
+                 mock.patch.object(scraper, "process_one_filing", return_value=skip_result), \
+                 mock.patch.object(scraper, "_write_result_batch"), \
+                 mock.patch.object(scraper.db, "commit"), \
+                 mock.patch.object(scraper.db, "get_filing_count", return_value=1), \
+                 mock.patch.object(scraper, "analyze_pending_sections",
+                                   side_effect=RuntimeError("summarizer exploded")):
+                resilient = scraper.run_scraper()
+            test("Analysis phase failure does not abort the run",
+                 resilient["analyzed"] == 0 and resilient["new_found"] == 1,
+                 f"analyzed={resilient.get('analyzed')}")
+            test("Analysis phase records timing for benchmarking",
+                 "analysis_seconds" in resilient["metrics"]["timings"])
+        finally:
+            config.DATA_DIR = old_data_dir
+
+    # Real analysis over a real extracted section — no mocks, no network, no API key.
+    with tempfile.TemporaryDirectory() as tmp:
+        old_paths = {
+            "DATA_DIR": config.DATA_DIR, "DB_PATH": config.DB_PATH,
+            "TEXT_CACHE_DIR": config.TEXT_CACHE_DIR,
+        }
+        try:
+            config.DATA_DIR = tmp
+            config.DB_PATH = os.path.join(tmp, "t.db")
+            config.TEXT_CACHE_DIR = os.path.join(tmp, "text_cache")
+            from crypto_tracker import database as adb
+            adb._init_done = False
+            if hasattr(adb._local, "conn") and adb._local.conn is not None:
+                adb._local.conn.close()
+                adb._local.conn = None
+            adb.init_db()
+
+            real_raw = load_sec_fixture("coinbase_2024_10k_excerpt.txt")
+            real_sec = extract_exact_risk_sections(real_raw, "10-K")[0]
+            scraper._write_filing_to_db({
+                "meta": {
+                    "accession_no": "0001679788-25-000099", "cik": "1679788",
+                    "company_name": "Coinbase Global Inc", "ticker": "COIN",
+                    "form_type": "10-K", "root_form": "10-K",
+                    "filing_date": "2025-02-15", "filing_category": "Operating Co.",
+                    "tier": 2, "sec_url": "https://sec.gov/x", "filing_pdf_url": "",
+                    "crypto_connection": "Reports bitcoin operations.",
+                    "entity_type": "Exchange", "purpose": "Annual report",
+                    "top_holdings": "BTC", "search_keyword": "bitcoin",
+                    "fetched_at": "2025-02-15T00:00:00",
+                    "processed_at": "2025-02-15T00:00:00",
+                },
+                "fund_docs": [],
+                "candidates": [dict(
+                    real_sec, section_type="risk_factors", title="Risk Factors",
+                    confidence=0.95, source_doc_name="coin-10k.htm",
+                    source_doc_url="https://sec.gov/x.htm", source_hash="a" * 64,
+                )],
+                "summary": "", "summary_model": "deferred",
+                "summary_text_hash": real_sec["exact_text_hash"],
+            })
+            adb.commit()
+
+            pending_before = adb.get_dashboard_stats()["analysis_pending"]
+            analyzed_n = scraper.analyze_pending_sections()
+            stats_after = adb.get_dashboard_stats()
+            saved_row = adb.get_filing_by_accession("0001679788-25-000099")
+
+            test("Deferred extraction leaves the filing analysis-pending",
+                 pending_before == 1, f"pending={pending_before}")
+            test("Analysis generates a real summary with no API key",
+                 analyzed_n == 1 and len(saved_row["risk_summary"]) > 80 and
+                 saved_row["summary_model"].startswith("template-"),
+                 f"model={saved_row['summary_model']!r}, len={len(saved_row['risk_summary'])}")
+            test("Analysis clears the pending counter",
+                 stats_after["analysis_pending"] == 0 and
+                 stats_after["analysis_complete"] == 1)
+            test("Analysis preserves the exact risk section untouched",
+                 saved_row["risk_section"] == real_sec["text"])
+            test("Re-running analysis is idempotent (nothing left pending)",
+                 scraper.analyze_pending_sections() == 0)
+
+            # Quality-gate rejection must not masquerade as a finished analysis.
+            with mock.patch.object(
+                scraper, "build_summary",
+                return_value={"summary": "", "model": "", "purpose": "", "top_holdings": ""},
+            ):
+                adb.get_connection().execute(
+                    "UPDATE filing_summaries SET text_hash = 'stale' WHERE is_current = 1"
+                )
+                adb.commit()
+                scraper.analyze_pending_sections()
+            rejected_row = adb.get_filing_by_accession("0001679788-25-000099")
+            test("Quality-gate rejection is recorded with an explicit model marker",
+                 rejected_row["summary_model"].startswith("no-summary"),
+                 f"model={rejected_row['summary_model']!r}")
+        finally:
+            from crypto_tracker import database as adb
+            if hasattr(adb._local, "conn") and adb._local.conn is not None:
+                adb._local.conn.close()
+                adb._local.conn = None
+            adb._init_done = False
+            for key, value in old_paths.items():
+                setattr(config, key, value)
+
+    # ── Test 12: v1.1.37 database-derived architecture ───────────────────
+    print("\n[12] Database-derived regeneration (v1.1.37)")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_paths = {
+            "DATA_DIR": config.DATA_DIR, "DB_PATH": config.DB_PATH,
+            "TEXT_CACHE_DIR": config.TEXT_CACHE_DIR,
+        }
+        try:
+            config.DATA_DIR = tmp
+            config.DB_PATH = os.path.join(tmp, "v37.db")
+            config.TEXT_CACHE_DIR = os.path.join(tmp, "text_cache")
+            from crypto_tracker import database as rdb
+            rdb._init_done = False
+            if hasattr(rdb._local, "conn") and rdb._local.conn is not None:
+                rdb._local.conn.close()
+                rdb._local.conn = None
+            rdb.init_db()
+
+            raw_doc = load_sec_fixture("coinbase_2024_10k_excerpt.txt")
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version,entity_type)
+                VALUES ('0000000037-24-000001','1679788','Coinbase Global Inc','COIN',
+                 '10-K','10-K','2024-02-15','Operating Co.',2,'https://sec.gov/x',
+                 'bitcoin','bitcoin','2024-02-15','2024-02-15','1.1.30-OLD',
+                 'Exchange — Annual report')
+            """)
+
+            # Raw source round-trip
+            stored_ok = rdb.save_raw_source(
+                "0000000037-24-000001", raw_doc,
+                doc_url="https://sec.gov/coin.htm", doc_name="coin.htm",
+            )
+            rdb.commit()
+            fetched = rdb.get_raw_source("0000000037-24-000001")
+            test("Raw source round-trips through the database byte-for-byte",
+                 stored_ok and fetched is not None and fetched["text"] == raw_doc)
+            raw_stats = rdb.get_raw_source_stats()
+            test("Raw source is stored compressed",
+                 0 < raw_stats["stored_bytes"] < raw_stats["raw_bytes"],
+                 f"{raw_stats['stored_bytes']} < {raw_stats['raw_bytes']}")
+            test("Raw source presence is queryable",
+                 rdb.has_raw_source("0000000037-24-000001") and
+                 not rdb.has_raw_source("0000000000-00-000000"))
+
+            # Stale-version detection
+            stale = rdb.get_stale_extraction_filings(config.EXTRACTION_VERSION)
+            test("Filings behind the current extraction version are detected",
+                 len(stale) == 1 and stale[0]["accession_no"] == "0000000037-24-000001")
+
+            # THE core guarantee: regeneration must not touch the network.
+            def _explode(*a, **k):
+                raise AssertionError("network call during offline regeneration")
+
+            with mock.patch.object(scraper, "_sec_get", _explode), \
+                 mock.patch.object(scraper, "_edgar_call", _explode), \
+                 mock.patch.object(scraper._sec_session, "get", _explode), \
+                 mock.patch.object(scraper._efts_session, "get", _explode):
+                regen = scraper.regenerate_stale_extractions()
+            test("Regeneration rebuilds stale filings with ZERO network calls",
+                 regen["rebuilt"] == 1 and regen["failed"] == 0,
+                 str(regen))
+
+            regenerated_row = rdb.get_filing_by_accession("0000000037-24-000001")
+            test("Regenerated filing is stamped with the current extraction version",
+                 regenerated_row["extraction_version"] == config.EXTRACTION_VERSION)
+            test("Regenerated filing has real extracted risk text",
+                 len(regenerated_row["risk_section"]) > 10000,
+                 f"{len(regenerated_row['risk_section'])} chars")
+            test("Regeneration reaches a fixed point (no repeated work)",
+                 len(rdb.get_stale_extraction_filings(config.EXTRACTION_VERSION)) == 0)
+
+            # Filings with no stored raw source are left alone, not re-downloaded.
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version)
+                VALUES ('0000000037-24-000002','999','No Source Inc','NSI','10-K','10-K',
+                 '2024-03-15','Operating Co.',2,'https://sec.gov/z','bitcoin','bitcoin',
+                 '2024-03-15','2024-03-15','1.1.30-OLD')
+            """)
+            rdb.commit()
+            test("Filings without stored raw source are excluded from offline regen",
+                 len(rdb.get_stale_extraction_filings(
+                     config.EXTRACTION_VERSION, require_raw_source=True)) == 0 and
+                 len(rdb.get_stale_extraction_filings(
+                     config.EXTRACTION_VERSION, require_raw_source=False)) == 1)
+
+            # Overview + what's new
+            scraper.analyze_pending_sections()
+            summarized = rdb.get_filing_by_accession("0000000037-24-000001")
+            test("Filing overview explains what the filing is",
+                 len(summarized["filing_overview"]) > 40 and
+                 "Coinbase" in summarized["filing_overview"],
+                 summarized["filing_overview"][:90])
+            test("Risk summary is still produced alongside the overview",
+                 len(summarized["risk_summary"]) > 40)
+            test("First filing for a filer has no what's-new diff",
+                 summarized["whats_new"] == "")
+
+            ibit_raw = load_sec_fixture("ibit_2024_424b3_excerpt.txt")
+            later = extract_exact_risk_sections(ibit_raw, "424B3")[0]
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version,entity_type)
+                VALUES ('0000000037-25-000003','1679788','Coinbase Global Inc','COIN',
+                 '10-K','10-K','2025-02-15','Operating Co.',2,'https://sec.gov/y',
+                 'bitcoin','bitcoin','2025-02-15','2025-02-15',?,'Exchange')
+            """, (config.EXTRACTION_VERSION,))
+            rdb.replace_sections("0000000037-25-000003", [{
+                "section_type": "risk_factors", "method": "exact_item_1a",
+                "title": "Risk Factors", "text": later["text"], "confidence": 0.95,
+                "source_doc_name": "y.htm", "source_doc_url": "https://sec.gov/y.htm",
+                "source_hash": "c" * 64, "exact_text_hash": later["exact_text_hash"],
+                "start_offset": later["start_offset"], "end_offset": later["end_offset"],
+            }])
+            rdb.commit()
+            scraper.analyze_pending_sections()
+            newer = rdb.get_filing_by_accession("0000000037-25-000003")
+            test("Later filing gets a what's-new diff against the prior one",
+                 "prior" in newer["whats_new"].lower() and "2024-02-15" in newer["whats_new"],
+                 newer["whats_new"][:110])
+            test("What's-new is derived from the DB, not the network",
+                 rdb.get_prior_filing_section(
+                     "1679788", "10-K", "2025-02-15",
+                     exclude_accession="0000000037-25-000003",
+                 )["accession_no"] == "0000000037-24-000001")
+        finally:
+            from crypto_tracker import database as rdb
+            if hasattr(rdb._local, "conn") and rdb._local.conn is not None:
+                rdb._local.conn.close()
+                rdb._local.conn = None
+            rdb._init_done = False
+            for key, value in old_paths.items():
+                setattr(config, key, value)
 
     # ── Summary ──────────────────────────────────────────────────────────
     passed = sum(1 for _, ok, _ in results if ok)

@@ -9,11 +9,11 @@
     {% block head %}{% endblock %}
 </head>
 <body>
-    <!-- NAVIGATION -->
+    <!-- MASTHEAD -->
     <nav class="nav-bar">
         <div class="nav-inner">
             <a href="/" class="nav-brand">
-                <span class="nav-icon">&#9878;</span>
+                <span class="nav-icon" aria-hidden="true">&#9878;</span>
                 <div>
                     <div class="nav-title">CRYPTO SEC FILING TRACKER <span class="version-pill">v{{ config.VERSION if config else '1.1.35' }}</span></div>
                     <div class="nav-sub">For Crypto Lawyers | SEC EDGAR | Interactive Dashboard</div>
@@ -25,7 +25,7 @@
                 <a href="/settings" class="nav-link {% if '/settings' in request.path %}active{% endif %}">Settings</a>
                 <div class="nav-actions">
                     <button id="btn-scrape" class="btn btn-primary" onclick="startScraper()">
-                        <span id="scrape-icon">&#9881;</span> Update Filings
+                        <span aria-hidden="true">&#9881;</span> Update Filings
                     </button>
                     <div class="dropdown">
                         <button class="btn btn-secondary">&#8615; Export</button>
@@ -42,7 +42,7 @@
     <!-- SCRAPER STATUS BAR -->
     <div id="scraper-bar" class="scraper-bar" style="display:none;">
         <div class="scraper-bar-inner">
-            <span class="scraper-spinner">&#8635;</span>
+            <span class="scraper-spinner" aria-hidden="true">&#8635;</span>
             <span id="scraper-msg">Starting scraper...</span>
             <div class="scraper-progress-wrap">
                 <div id="scraper-progress" class="scraper-progress" style="width:0%"></div>
@@ -76,14 +76,66 @@
         </div>
     </footer>
 
+    <!-- APP DIALOG (replaces native alert/confirm; falls back to native) -->
+    <dialog id="ui-dialog" class="ui-dialog" aria-labelledby="ui-dialog-title">
+        <form method="dialog">
+            <div class="ui-dialog-body">
+                <div class="ui-dialog-title" id="ui-dialog-title">Notice</div>
+                <div id="ui-dialog-message"></div>
+            </div>
+            <div class="ui-dialog-actions">
+                <button value="cancel" id="ui-dialog-cancel" class="btn btn-sm">Cancel</button>
+                <button value="ok" id="ui-dialog-ok" class="btn btn-primary btn-sm">OK</button>
+            </div>
+        </form>
+    </dialog>
+
     <script>
+    // ═══════════════ DIALOGS (uiAlert / uiConfirm) ═══════════════
+    // Promise-based replacements for window.alert / window.confirm. If the
+    // browser has no <dialog> support we fall back to the native calls so
+    // behaviour never silently disappears.
+    function uiDialog(message, { title = 'Notice', confirm = false } = {}) {
+        const dlg = document.getElementById('ui-dialog');
+        if (!dlg || typeof dlg.showModal !== 'function') {
+            return Promise.resolve(confirm ? window.confirm(message) : (window.alert(message), true));
+        }
+        document.getElementById('ui-dialog-title').textContent = title;
+        document.getElementById('ui-dialog-message').textContent = message;
+        const cancelBtn = document.getElementById('ui-dialog-cancel');
+        const okBtn = document.getElementById('ui-dialog-ok');
+        cancelBtn.style.display = confirm ? '' : 'none';
+        okBtn.textContent = confirm ? 'Confirm' : 'OK';
+        return new Promise(resolve => {
+            dlg.addEventListener('close', function handler() {
+                dlg.removeEventListener('close', handler);
+                resolve(dlg.returnValue === 'ok');
+            });
+            dlg.returnValue = '';
+            dlg.showModal();
+            okBtn.focus();
+        });
+    }
+    function uiAlert(message, title) { return uiDialog(message, { title: title || 'Notice' }); }
+    function uiConfirm(message, title) { return uiDialog(message, { title: title || 'Please confirm', confirm: true }); }
+
     // ═══════════════ SCRAPER CONTROL ═══════════════
+    // Single source of truth for the Update button markup. It is written in
+    // several places below; changing the icon here changes all of them.
+    const SCRAPE_BTN_IDLE = '<span aria-hidden="true">&#9881;</span> Update Filings';
+    const SCRAPE_BTN_RUNNING = '<span class="spin" aria-hidden="true">&#8635;</span> Running...';
+
     let scraperPolling = null;
 
-    function startScraper() {
+    function setScrapeButton(running) {
         const btn = document.getElementById('btn-scrape');
-        btn.disabled = true;
-        btn.innerHTML = '<span class="spin">&#8635;</span> Running...';
+        if (!btn) return;
+        btn.disabled = running;
+        btn.innerHTML = running ? SCRAPE_BTN_RUNNING : SCRAPE_BTN_IDLE;
+    }
+
+    function startScraper() {
+        setScrapeButton(true);
         document.getElementById('scraper-bar').style.display = 'block';
         document.getElementById('scraper-msg').textContent = 'Starting scraper...';
 
@@ -91,17 +143,15 @@
             .then(r => r.json())
             .then(data => {
                 if (data.error) {
-                    alert(data.error);
-                    btn.disabled = false;
-                    btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                    uiAlert(data.error, 'Scraper');
+                    setScrapeButton(false);
                     return;
                 }
                 scraperPolling = setInterval(pollScraperStatus, 2000);
             })
             .catch(err => {
-                alert('Failed to start scraper: ' + err);
-                btn.disabled = false;
-                btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                uiAlert('Failed to start scraper: ' + err, 'Scraper');
+                setScrapeButton(false);
             });
     }
 
@@ -116,9 +166,7 @@
                 }
                 if (!status.running) {
                     clearInterval(scraperPolling);
-                    const btn = document.getElementById('btn-scrape');
-                    btn.disabled = false;
-                    btn.innerHTML = '<span>&#9881;</span> Update Filings';
+                    setScrapeButton(false);
                     const msg = status.message || '';
                     const didWork = /\b[1-9]\d* new\b/.test(msg)
                         || /reprocessed \d+/i.test(msg)
@@ -136,8 +184,7 @@
         .then(r => r.json())
         .then(status => {
             if (status.running) {
-                document.getElementById('btn-scrape').disabled = true;
-                document.getElementById('btn-scrape').innerHTML = '<span class="spin">&#8635;</span> Running...';
+                setScrapeButton(true);
                 document.getElementById('scraper-bar').style.display = 'block';
                 document.getElementById('scraper-msg').textContent = status.message;
                 scraperPolling = setInterval(pollScraperStatus, 2000);

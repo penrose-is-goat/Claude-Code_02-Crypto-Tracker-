@@ -1,5 +1,25 @@
 """
-Configuration for Crypto SEC Filing Tracker v1.1.35.
+Configuration for Crypto SEC Filing Tracker v1.1.37.
+
+v1.1.37 changes:
+- Raw filing source is now stored durably IN the database (gzip-compressed),
+  not only in a deletable filesystem cache. The DB is the single source of
+  truth: extraction can be re-derived offline with zero SEC traffic.
+- Per-filing extraction_version stamps let an update regenerate only the
+  filings a newer extractor would actually change, instead of all-or-nothing.
+- Filing overview + "what's new" (diffed against the prior filing of the
+  same company/form) alongside the risk-factor summary.
+- FRED-inspired light UI replacing the dark retro theme.
+
+v1.1.36 changes:
+- edgartools fallback is now bounded: low concurrency gate, its own rate
+  limit, longer HTTP/pool timeouts, and retry on transient timeouts.
+  Fixes hour-long runs full of PoolTimeout('') errors when many worker
+  threads piled onto edgartools' shared throttled HTTP client.
+- Empty fetched text (0 chars) is a retryable failure, not a terminal
+  skip — transient network failures no longer permanently drop filings.
+- Missing doc URLs are resolved via the direct archive index before
+  falling back to edgartools, keeping the hot path on plain requests.
 
 v1.1.35 changes:
 - Faster direct SEC submissions discovery for known CIKs
@@ -24,8 +44,8 @@ import os
 from datetime import datetime
 
 # ─── Version ──────────────────────────────────────────────────────────────
-VERSION = "1.1.35"
-VERSION_NAME = "Batch 1 — SEC Filing Tracker (fast exact risk extraction)"
+VERSION = "1.1.37"
+VERSION_NAME = "Batch 1 — SEC Filing Tracker (database-derived, FRED UI)"
 
 # ─── Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -82,6 +102,18 @@ SEC_BACKOFF_BASE = 2.0
 SEC_BACKOFF_MAX = 60.0
 SEC_429_COOLDOWN = 10.0
 
+# ─── edgartools fallback guard (v1.1.36) ─────────────────────────────────
+# edgartools is only a fallback (no direct doc URL / attachments needed),
+# but its shared httpx client has its own throttle and a short default
+# pool timeout. Unbounded, IO_THREADS workers pile onto it and every call
+# dies with PoolTimeout(''). Bound its concurrency, slow its rate so the
+# combined direct+edgartools request rate stays under SEC's 10/s, and
+# retry transient timeouts instead of dropping the filing.
+EDGARTOOLS_MAX_CONCURRENCY = 2   # Max worker threads inside edgartools at once
+EDGARTOOLS_RATE_LIMIT_PER_SEC = 2  # edgartools' own limiter (EDGAR_RATE_LIMIT_PER_SEC)
+EDGARTOOLS_RETRIES = 2           # Extra attempts on Timeout/PoolTimeout errors
+EDGARTOOLS_RETRY_DELAY = 3.0     # Seconds between fallback retries
+
 # ─── EFTS direct-HTTP search (bypasses edgartools' PoolTimeout) ──────────
 EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 EFTS_TIMEOUT = 15           # Per-search timeout, much shorter than 60s default
@@ -110,6 +142,26 @@ FAST_HTML_CLEAN_BYTES = 750_000
 
 # Bump when discovery/extraction skip decisions need to be re-audited.
 PROCESSOR_VERSION = f"{VERSION}-{TEXT_CACHE_VERSION}-skipstate-v2-cik-validated"
+
+# ─── Durable raw source + offline regeneration (v1.1.37) ─────────────────
+# Raw filing HTML is stored gzip-compressed in the DB so re-extraction never
+# needs SEC. RAW_DOC_CACHE_DIR remains a fast read-through cache, but it is
+# now expendable: wiping it costs speed, not data.
+STORE_RAW_SOURCE_IN_DB = True
+RAW_SOURCE_GZIP_LEVEL = 6         # ~10-15% of original size for SEC HTML
+RAW_SOURCE_MAX_BYTES = 25_000_000  # Skip absurd outliers rather than bloat the DB
+
+# EXTRACTION_VERSION stamps each stored section. An update run regenerates
+# only filings whose stamp is behind — from local raw source, no network.
+# Bump this (not VERSION) whenever extraction logic changes what gets stored.
+EXTRACTION_VERSION = f"{VERSION}-exact-v1"
+
+# Cap per regeneration pass so a version bump can't turn one click into an
+# unbounded job. 0 = no cap.
+REGENERATE_BATCH_LIMIT = 0
+# Regeneration is local-only by default: a filing with no stored raw source
+# is left alone rather than silently re-downloaded from SEC.
+REGENERATE_ALLOW_NETWORK = False
 
 # ─── Search Keywords ─────────────────────────────────────────────────────
 KEYWORDS = [
@@ -285,7 +337,11 @@ CORE_COMPANY_FORM_TYPES = ["10-K", "10-Q"]
 EVENT_RISK_COMPANY_FORM_TYPES = RISK_DEFAULT_COMPANY_FORM_TYPES + ["8-K"]
 ALL_COMPANY_FORM_TYPES = COMPANY_FORM_TYPES
 
-SCRAPE_MODES = {"exact_only", "analysis_only", "low_confidence_only", "all_cached"}
+SCRAPE_MODES = {
+    "exact_only", "analysis_only", "low_confidence_only", "all_cached",
+    "backfill_source",   # one-time: populate durable raw source for old filings
+    "regenerate",        # offline rebuild of filings behind EXTRACTION_VERSION
+}
 SCRAPE_SCOPES = {"risk_default", "core", "event_risk", "all"}
 DEFAULT_SCRAPE_MODE = "exact_only"
 DEFAULT_SCRAPE_SCOPE = "risk_default"

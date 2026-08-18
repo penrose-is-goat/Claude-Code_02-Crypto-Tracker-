@@ -58,6 +58,107 @@ def build_summary(text: str, form_type: str = "",
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# FILING OVERVIEW + WHAT'S NEW (v1.1.37)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_overview(text: str, form_type: str = "", company_name: str = "",
+                   ticker: str = "", entity_type: str = "") -> str:
+    """One plain-English sentence or two saying what this filing actually is.
+
+    Deliberately separate from the risk summary: the risk summary answers
+    "what could go wrong", this answers "what am I looking at". Reads like
+    "Grayscale Ethereum Trust (ETHE) — quarterly report covering Ethereum,
+    with risk disclosure across 7 areas."
+    """
+    if not text:
+        return ""
+    info = _detect_entity_and_type(text, form_type, company_name)
+    entity = company_name or info["entity"] or "This filer"
+    label = f"{entity} ({ticker})" if ticker else entity
+
+    purpose = info["filing_purpose"] or f"{form_type} filing"
+    fund = _guess_subject_name(text)
+    if fund and fund.lower() not in entity.lower():
+        opening = f"{label} — {purpose} for {fund}"
+    else:
+        opening = f"{label} — {purpose}"
+
+    assets = info["crypto_assets"]
+    if assets:
+        opening += f", covering {', '.join(assets[:3])}"
+    opening += "."
+
+    parts = [opening]
+    if entity_type and entity_type.lower() not in opening.lower():
+        parts.append(f"Classified as {entity_type}.")
+
+    categories = _detect_risk_categories(text)
+    if categories:
+        parts.append(
+            f"Risk disclosure spans {len(categories)} areas including "
+            + ", ".join(categories[:3]) + "."
+        )
+    return " ".join(parts)[:800]
+
+
+_SUBJECT_RE = [
+    re.compile(r"\b([A-Z][A-Za-z&.\s]{3,60}(?:Trust|Fund|ETF))\b"),
+    re.compile(r"\bthe\s+([A-Z][A-Za-z&.\s]{3,50}(?:Trust|Fund|ETF))\b"),
+]
+
+
+def _guess_subject_name(text: str) -> str:
+    """Pull the fund/trust this filing is about out of the opening text."""
+    head = text[:4000]
+    for pat in _SUBJECT_RE:
+        m = pat.search(head)
+        if m:
+            name = re.sub(r"\s+", " ", m.group(1)).strip()
+            if 8 < len(name) < 70:
+                return name
+    return ""
+
+
+def build_whats_new(text: str, prior_text: str, form_type: str = "",
+                    prior_form_type: str = "", prior_date: str = "") -> str:
+    """Describe how this filing differs from the filer's previous one.
+
+    Derived entirely from data already in the database — the prior filing's
+    stored section text — so it costs no network and no API call.
+    """
+    if not text or not prior_text:
+        return ""
+
+    now_cats = set(_detect_risk_categories(text))
+    prior_cats = set(_detect_risk_categories(prior_text))
+    added = sorted(now_cats - prior_cats)
+    removed = sorted(prior_cats - now_cats)
+
+    delta = len(text) - len(prior_text)
+    pct = (delta / len(prior_text) * 100) if prior_text else 0
+
+    bits = []
+    ref = f"the prior {prior_form_type or form_type}"
+    if prior_date:
+        ref += f" ({prior_date})"
+
+    if added:
+        bits.append(f"newly discusses {', '.join(added[:4])}")
+    if removed:
+        bits.append(f"no longer discusses {', '.join(removed[:3])}")
+    if abs(pct) >= 15:
+        direction = "longer" if delta > 0 else "shorter"
+        bits.append(f"risk section is {abs(pct):.0f}% {direction}")
+
+    if not bits:
+        return (
+            f"No material change in risk-topic coverage versus {ref}; "
+            f"length within 15%."
+        )
+    return f"Versus {ref}: " + "; ".join(bits) + "."
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLAUDE API SUMMARIZER
 # ═══════════════════════════════════════════════════════════════════════════
 

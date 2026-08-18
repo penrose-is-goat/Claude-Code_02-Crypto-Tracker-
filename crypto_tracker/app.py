@@ -163,6 +163,7 @@ def settings_page():
         config=config,
         scraper_status=_scraper_status,
         db_count=db.get_filing_count(),
+        raw_source=db.get_raw_source_stats(),
         now=datetime.now(),
     )
 
@@ -343,18 +344,45 @@ def api_reprocess():
 
     only_low = request.args.get("only_low_confidence", "0") == "1"
     mode = request.args.get("mode", "all_cached")
-    if mode not in {"analysis_only", "low_confidence_only", "all_cached"}:
+    if mode not in {"analysis_only", "low_confidence_only", "all_cached",
+                    "backfill_source", "regenerate"}:
         return jsonify({"error": f"Invalid reprocess mode: {mode}"}), 400
     limit = request.args.get("limit", type=int)
 
     def _run():
         try:
-            from .scraper import analyze_pending_sections
+            from .scraper import (
+                analyze_pending_sections, backfill_raw_source,
+                regenerate_stale_extractions,
+            )
             if mode == "analysis_only":
                 n = analyze_pending_sections(
                     limit=limit, progress_callback=_scraper_progress,
                 )
                 message = f"Analyzed {n} pending sections"
+            elif mode == "backfill_source":
+                # One-time: give older filings durable raw source so they
+                # become offline-regenerable from here on.
+                back = backfill_raw_source(
+                    limit=limit, progress_callback=_scraper_progress,
+                )
+                message = (
+                    f"Stored raw source for {back['stored']}/{back['total']} filings "
+                    f"({back['from_cache']} from local cache, {back['failed']} failed)"
+                )
+            elif mode == "regenerate":
+                regen = regenerate_stale_extractions(
+                    limit=limit, progress_callback=_scraper_progress,
+                )
+                analyzed = analyze_pending_sections(
+                    progress_callback=_scraper_progress,
+                )
+                message = (
+                    f"Regenerated {regen['rebuilt']}/{regen['total']} filings offline, "
+                    f"analyzed {analyzed}"
+                    + (f" ({regen['no_source']} lack stored source — run Backfill first)"
+                       if regen.get("no_source") else "")
+                )
             else:
                 n = reprocess_existing(
                     limit=limit,

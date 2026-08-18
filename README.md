@@ -1,10 +1,79 @@
 # Crypto SEC Filing Tracker
 
-**v1.1.35** — Batch 1: SEC Filing Tracker
+**v1.1.37** — Batch 1: SEC Filing Tracker
 
 Web app that tracks SEC EDGAR filings for crypto/digital-asset content.
 Extracts risk sections, generates AI summaries, presents an interactive
 dashboard for crypto lawyers.
+
+## What Changed in v1.1.37
+
+### 1. The Database Is the Source of Truth
+
+Raw filing source is now stored **in the database**, gzip-compressed, at the
+moment a filing is first fetched. Previously the only copy lived in a
+filesystem cache under `~/.crypto_tracker_cache` that `clear_runtime_caches()`
+deletes — so "re-extract everything" silently meant "re-download everything
+from SEC."
+
+With the source in the database, improved extraction is re-derived locally.
+Browsing never contacts SEC (it did not before either), and now neither does
+regeneration.
+
+### 2. Version-Targeted Regeneration
+
+Each filing records the `EXTRACTION_VERSION` that produced its stored data.
+An update run rebuilds only the filings whose stamp is behind — not
+all-or-nothing reprocessing. Bump `EXTRACTION_VERSION` in `config.py` when
+extraction logic changes what gets stored, and the next update regenerates
+exactly the affected filings, offline.
+
+Filings where the new extractor produces nothing usable keep their existing
+data rather than having it overwritten with a worse result.
+
+`backfill_raw_source()` is the one-time catch-up for filings stored by earlier
+versions, which have no raw source in the database yet. It reads the local
+cache first and only contacts SEC for what it must.
+
+### 3. Filing Overview and What's New
+
+Alongside the risk-factor summary, each filing now carries:
+
+- **Overview** — plain English on what the filing actually is
+  ("Coinbase Global Inc (COIN) — annual report, covering Bitcoin, stablecoins…")
+- **What's new** — a diff against that filer's previous filing of the same
+  form ("Versus the prior 10-K (2024-02-15): newly discusses valuation")
+
+Both are derived from data already in the database, so they cost no network
+requests and no API calls. They work without an Anthropic API key.
+
+### 4. FRED-Inspired Interface
+
+The dark retro theme is replaced with a light, institutional design modeled on
+the St. Louis Fed's FRED site: navy masthead, white canvas, hairline rules,
+dense readable data tables, restrained blue accents. Base font size increased
+from 13px to 15px.
+
+## What Changed in v1.1.36
+
+### Bounded edgartools Fallback
+
+Update runs could crawl for hours at ~0.1 filings/sec with logs full of
+`PoolTimeout('')`. All worker threads were piling onto edgartools' shared
+throttled HTTP client (5s pool timeout, its own rate limiter). Worse, those
+errors were swallowed and recorded as terminal "text too short (0 chars)"
+skips, permanently dropping real filings.
+
+edgartools calls now run behind a concurrency gate with retry on transient
+timeouts, its rate limit is capped so the combined request rate stays under
+SEC's 10/s, and empty fetched text is a retryable failure rather than a
+terminal skip.
+
+### Analysis Runs Automatically
+
+`exact_only` mode defers summaries by design, but nothing in the UI ever
+triggered the code that generates them, so filings sat at "Analysis pending"
+forever. Analysis now runs as a phase of every update and reprocess.
 
 ## What Changed in v1.1.35
 
@@ -241,7 +310,7 @@ Research sources that informed this rewrite:
 
 | Batch | Description | Status |
 |-------|-------------|--------|
-| **1** | SEC Filing Tracker | v1.1.35 current |
+| **1** | SEC Filing Tracker | v1.1.37 current |
 | 2 | Regulatory Action Tracker (SEC/CFTC litigation, no-action letters) | Planned |
 | 3 | Real-Time Alerts (RSS monitors + push notifications) | Planned |
 | 4 | Full SEC Coverage (beyond crypto) | Planned |

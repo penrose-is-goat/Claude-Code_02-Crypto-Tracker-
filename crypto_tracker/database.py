@@ -26,6 +26,8 @@ v1.1.33.1 hotfix:
   current, and returns without taking ANY write lock. DDL and backfill only
   run when SCHEMA_VERSION is bumped.
 """
+import gzip
+import hashlib
 import os
 import sqlite3
 import threading
@@ -42,7 +44,7 @@ _init_lock = threading.Lock()
 # Bump this whenever the schema or the COMPANY_DETAILS lookup changes.
 # init_db() compares against PRAGMA user_version and only runs DDL/backfill
 # when the on-disk version is behind.
-SCHEMA_VERSION = 5  # v1.1.35: exact-section provenance + skip-state cache
+SCHEMA_VERSION = 6  # v1.1.37: durable raw source + version stamps + overview/whats_new
 
 
 def _ensure_data_dir():
@@ -203,11 +205,53 @@ def _run_ddl(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_status ON filing_attempts(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_version ON filing_attempts(processor_version)")
 
+    # v1.1.37: durable raw source. This is the ONLY copy that matters — the
+    # filesystem cache under EDGAR_CACHE_DIR is a read-through accelerator and
+    # is wiped by clear_runtime_caches(). Storing the raw bytes here is what
+    # makes offline re-extraction possible: without it, every extractor
+    # improvement means re-downloading thousands of documents from SEC.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS filing_raw_source (
+            accession_no     TEXT PRIMARY KEY,
+            doc_url          TEXT DEFAULT '',
+            doc_name         TEXT DEFAULT '',
+            content_gzip     BLOB NOT NULL,
+            raw_sha256       TEXT DEFAULT '',
+            raw_bytes        INTEGER DEFAULT 0,
+            stored_bytes     INTEGER DEFAULT 0,
+            encoding         TEXT DEFAULT 'utf-8',
+            fetched_at       TEXT DEFAULT '',
+            FOREIGN KEY (accession_no) REFERENCES filings(accession_no)
+                ON DELETE CASCADE
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_raw_source_hash ON filing_raw_source(raw_sha256)"
+    )
+
     for col in ("purpose", "top_holdings", "entity_type"):
         try:
             conn.execute(f"ALTER TABLE filings ADD COLUMN {col} TEXT DEFAULT ''")
         except Exception:
             pass
+
+    # v1.1.37: per-filing version stamps so regeneration can target only the
+    # rows a newer extractor would actually change.
+    for col in ("extraction_version", "processor_version"):
+        try:
+            conn.execute(f"ALTER TABLE filings ADD COLUMN {col} TEXT DEFAULT ''")
+        except Exception:
+            pass
+    try:
+        conn.execute(
+            "ALTER TABLE filing_sections ADD COLUMN extraction_version TEXT DEFAULT ''"
+        )
+    except Exception:
+        pass
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_filings_extraction_version "
+        "ON filings(extraction_version)"
+    )
 
     section_columns = {
         "source_doc_name": "TEXT DEFAULT ''",
@@ -227,6 +271,14 @@ def _run_ddl(conn):
         conn.execute("ALTER TABLE filing_summaries ADD COLUMN text_hash TEXT DEFAULT ''")
     except Exception:
         pass
+
+    # v1.1.37: plain-English filing overview and a diff against the prior
+    # filing of the same company/form, stored alongside the risk summary.
+    for col in ("overview", "whats_new"):
+        try:
+            conn.execute(f"ALTER TABLE filing_summaries ADD COLUMN {col} TEXT DEFAULT ''")
+        except Exception:
+            pass
 
     conn.execute("DROP VIEW IF EXISTS v_filings_display")
     conn.execute("""
@@ -249,12 +301,19 @@ def _run_ddl(conn):
             s.end_offset,
             COALESCE(sm.summary, '')      AS risk_summary,
             COALESCE(sm.model, '')        AS summary_model,
-            COALESCE(sm.text_hash, '')    AS summary_text_hash
+            COALESCE(sm.text_hash, '')    AS summary_text_hash,
+            COALESCE(sm.overview, '')     AS filing_overview,
+            COALESCE(sm.whats_new, '')    AS whats_new,
+            COALESCE(f.extraction_version, '') AS extraction_version,
+            COALESCE(rs.raw_bytes, 0)     AS raw_source_bytes,
+            CASE WHEN rs.accession_no IS NULL THEN 0 ELSE 1 END AS has_raw_source
         FROM filings f
         LEFT JOIN filing_sections s
             ON s.accession_no = f.accession_no AND s.is_primary = 1
         LEFT JOIN filing_summaries sm
             ON sm.accession_no = f.accession_no AND sm.is_current = 1
+        LEFT JOIN filing_raw_source rs
+            ON rs.accession_no = f.accession_no
     """)
 
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -477,7 +536,7 @@ def get_primary_section_id(accession_no: str):
 
 
 def upsert_summary(accession_no: str, summary: str, model: str, section_id=None,
-                   text_hash: str = ""):
+                   text_hash: str = "", overview: str = "", whats_new: str = ""):
     """Replace the current summary. Old summaries stay but lose is_current."""
     conn = get_connection()
     conn.execute(
@@ -486,9 +545,157 @@ def upsert_summary(accession_no: str, summary: str, model: str, section_id=None,
     )
     conn.execute("""
         INSERT INTO filing_summaries
-            (accession_no, section_id, model, summary, text_hash, is_current, created_at)
-        VALUES (?, ?, ?, ?, ?, 1, ?)
-    """, (accession_no, section_id, model, summary, text_hash, datetime.now().isoformat()))
+            (accession_no, section_id, model, summary, text_hash,
+             overview, whats_new, is_current, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+    """, (accession_no, section_id, model, summary, text_hash,
+          overview, whats_new, datetime.now().isoformat()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DURABLE RAW SOURCE (v1.1.37)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def save_raw_source(accession_no: str, raw_text: str, doc_url: str = "",
+                    doc_name: str = "") -> bool:
+    """Persist a filing's raw source in the DB, gzip-compressed.
+
+    This is what makes the database the single source of truth: with the raw
+    bytes here, improved extraction can be re-derived offline. Returns True if
+    stored. Oversized documents are skipped rather than bloating the DB.
+    """
+    if not getattr(config, "STORE_RAW_SOURCE_IN_DB", True):
+        return False
+    if not accession_no or not raw_text:
+        return False
+    encoded = raw_text.encode("utf-8", errors="replace")
+    max_bytes = int(getattr(config, "RAW_SOURCE_MAX_BYTES", 25_000_000) or 0)
+    if max_bytes and len(encoded) > max_bytes:
+        return False
+    level = int(getattr(config, "RAW_SOURCE_GZIP_LEVEL", 6))
+    blob = gzip.compress(encoded, compresslevel=level)
+    get_connection().execute("""
+        INSERT INTO filing_raw_source
+            (accession_no, doc_url, doc_name, content_gzip, raw_sha256,
+             raw_bytes, stored_bytes, encoding, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'utf-8', ?)
+        ON CONFLICT(accession_no) DO UPDATE SET
+            doc_url=excluded.doc_url,
+            doc_name=excluded.doc_name,
+            content_gzip=excluded.content_gzip,
+            raw_sha256=excluded.raw_sha256,
+            raw_bytes=excluded.raw_bytes,
+            stored_bytes=excluded.stored_bytes,
+            fetched_at=excluded.fetched_at
+    """, (
+        accession_no, doc_url, doc_name, blob,
+        hashlib.sha256(encoded).hexdigest(),
+        len(encoded), len(blob), datetime.now().isoformat(),
+    ))
+    return True
+
+
+def get_raw_source(accession_no: str):
+    """Return the stored raw source text, or None. Zero network."""
+    row = get_connection().execute(
+        "SELECT content_gzip, doc_url, doc_name FROM filing_raw_source "
+        "WHERE accession_no = ?",
+        (accession_no,),
+    ).fetchone()
+    if not row or row["content_gzip"] is None:
+        return None
+    try:
+        return {
+            "text": gzip.decompress(row["content_gzip"]).decode("utf-8", errors="replace"),
+            "doc_url": row["doc_url"] or "",
+            "doc_name": row["doc_name"] or "",
+        }
+    except Exception:
+        return None
+
+
+def has_raw_source(accession_no: str) -> bool:
+    return get_connection().execute(
+        "SELECT 1 FROM filing_raw_source WHERE accession_no = ?", (accession_no,),
+    ).fetchone() is not None
+
+
+def get_raw_source_stats() -> dict:
+    row = get_connection().execute("""
+        SELECT COUNT(*) AS n,
+               COALESCE(SUM(raw_bytes), 0) AS raw_bytes,
+               COALESCE(SUM(stored_bytes), 0) AS stored_bytes
+        FROM filing_raw_source
+    """).fetchone()
+    total = get_connection().execute(
+        "SELECT COUNT(*) AS c FROM filings"
+    ).fetchone()["c"]
+    return {
+        "with_raw_source": row["n"],
+        "total_filings": total,
+        "missing_raw_source": max(0, total - row["n"]),
+        "raw_bytes": row["raw_bytes"],
+        "stored_bytes": row["stored_bytes"],
+    }
+
+
+def get_stale_extraction_filings(extraction_version: str, limit: int = 0,
+                                 require_raw_source: bool = True):
+    """Filings whose stored extraction predates `extraction_version`.
+
+    This is the targeted alternative to reprocessing everything: only rows a
+    newer extractor would actually change are returned. When
+    require_raw_source is set, only filings we can rebuild offline qualify.
+    """
+    query = """
+        SELECT f.accession_no, f.cik, f.company_name, f.ticker,
+               f.form_type, f.root_form, f.filing_date, f.tier, f.search_keyword,
+               COALESCE(sec.source_doc_url, '') AS source_doc_url,
+               COALESCE(sec.source_doc_name, '') AS source_doc_name
+        FROM filings f
+        LEFT JOIN filing_sections sec
+          ON sec.accession_no = f.accession_no AND sec.is_primary = 1
+        WHERE COALESCE(f.extraction_version, '') != ?
+    """
+    if require_raw_source:
+        query += (
+            " AND EXISTS (SELECT 1 FROM filing_raw_source r "
+            "WHERE r.accession_no = f.accession_no)"
+        )
+    query += " ORDER BY f.filing_date DESC"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    return [dict(r) for r in get_connection().execute(query, (extraction_version,)).fetchall()]
+
+
+def set_extraction_version(accession_no: str, extraction_version: str,
+                           processor_version: str = ""):
+    get_connection().execute(
+        "UPDATE filings SET extraction_version = ?, processor_version = ? "
+        "WHERE accession_no = ?",
+        (extraction_version, processor_version, accession_no),
+    )
+
+
+def get_prior_filing_section(cik: str, root_form: str, filing_date: str,
+                             exclude_accession: str = ""):
+    """Most recent earlier filing of the same company+form, with its primary
+    section text. Used to derive "what's new" without leaving the DB."""
+    if not cik or not root_form or not filing_date:
+        return None
+    row = get_connection().execute("""
+        SELECT f.accession_no, f.filing_date, f.form_type,
+               COALESCE(sec.text, '') AS text
+        FROM filings f
+        JOIN filing_sections sec
+          ON sec.accession_no = f.accession_no AND sec.is_primary = 1
+        WHERE f.cik = ? AND f.root_form = ? AND f.filing_date < ?
+          AND f.accession_no != ?
+          AND sec.text != ''
+        ORDER BY f.filing_date DESC
+        LIMIT 1
+    """, (cik, root_form, filing_date, exclude_accession or "")).fetchone()
+    return dict(row) if row else None
 
 
 def get_current_summary_hash(accession_no: str):

@@ -1476,6 +1476,144 @@ markets may adversely affect the fund. These risks may be significant.
             for key, value in old_paths.items():
                 setattr(config, key, value)
 
+    # ── Test 12: v1.1.37 database-derived architecture ───────────────────
+    print("\n[12] Database-derived regeneration (v1.1.37)")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_paths = {
+            "DATA_DIR": config.DATA_DIR, "DB_PATH": config.DB_PATH,
+            "TEXT_CACHE_DIR": config.TEXT_CACHE_DIR,
+        }
+        try:
+            config.DATA_DIR = tmp
+            config.DB_PATH = os.path.join(tmp, "v37.db")
+            config.TEXT_CACHE_DIR = os.path.join(tmp, "text_cache")
+            from crypto_tracker import database as rdb
+            rdb._init_done = False
+            if hasattr(rdb._local, "conn") and rdb._local.conn is not None:
+                rdb._local.conn.close()
+                rdb._local.conn = None
+            rdb.init_db()
+
+            raw_doc = load_sec_fixture("coinbase_2024_10k_excerpt.txt")
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version,entity_type)
+                VALUES ('0000000037-24-000001','1679788','Coinbase Global Inc','COIN',
+                 '10-K','10-K','2024-02-15','Operating Co.',2,'https://sec.gov/x',
+                 'bitcoin','bitcoin','2024-02-15','2024-02-15','1.1.30-OLD',
+                 'Exchange — Annual report')
+            """)
+
+            # Raw source round-trip
+            stored_ok = rdb.save_raw_source(
+                "0000000037-24-000001", raw_doc,
+                doc_url="https://sec.gov/coin.htm", doc_name="coin.htm",
+            )
+            rdb.commit()
+            fetched = rdb.get_raw_source("0000000037-24-000001")
+            test("Raw source round-trips through the database byte-for-byte",
+                 stored_ok and fetched is not None and fetched["text"] == raw_doc)
+            raw_stats = rdb.get_raw_source_stats()
+            test("Raw source is stored compressed",
+                 0 < raw_stats["stored_bytes"] < raw_stats["raw_bytes"],
+                 f"{raw_stats['stored_bytes']} < {raw_stats['raw_bytes']}")
+            test("Raw source presence is queryable",
+                 rdb.has_raw_source("0000000037-24-000001") and
+                 not rdb.has_raw_source("0000000000-00-000000"))
+
+            # Stale-version detection
+            stale = rdb.get_stale_extraction_filings(config.EXTRACTION_VERSION)
+            test("Filings behind the current extraction version are detected",
+                 len(stale) == 1 and stale[0]["accession_no"] == "0000000037-24-000001")
+
+            # THE core guarantee: regeneration must not touch the network.
+            def _explode(*a, **k):
+                raise AssertionError("network call during offline regeneration")
+
+            with mock.patch.object(scraper, "_sec_get", _explode), \
+                 mock.patch.object(scraper, "_edgar_call", _explode), \
+                 mock.patch.object(scraper._sec_session, "get", _explode), \
+                 mock.patch.object(scraper._efts_session, "get", _explode):
+                regen = scraper.regenerate_stale_extractions()
+            test("Regeneration rebuilds stale filings with ZERO network calls",
+                 regen["rebuilt"] == 1 and regen["failed"] == 0,
+                 str(regen))
+
+            regenerated_row = rdb.get_filing_by_accession("0000000037-24-000001")
+            test("Regenerated filing is stamped with the current extraction version",
+                 regenerated_row["extraction_version"] == config.EXTRACTION_VERSION)
+            test("Regenerated filing has real extracted risk text",
+                 len(regenerated_row["risk_section"]) > 10000,
+                 f"{len(regenerated_row['risk_section'])} chars")
+            test("Regeneration reaches a fixed point (no repeated work)",
+                 len(rdb.get_stale_extraction_filings(config.EXTRACTION_VERSION)) == 0)
+
+            # Filings with no stored raw source are left alone, not re-downloaded.
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version)
+                VALUES ('0000000037-24-000002','999','No Source Inc','NSI','10-K','10-K',
+                 '2024-03-15','Operating Co.',2,'https://sec.gov/z','bitcoin','bitcoin',
+                 '2024-03-15','2024-03-15','1.1.30-OLD')
+            """)
+            rdb.commit()
+            test("Filings without stored raw source are excluded from offline regen",
+                 len(rdb.get_stale_extraction_filings(
+                     config.EXTRACTION_VERSION, require_raw_source=True)) == 0 and
+                 len(rdb.get_stale_extraction_filings(
+                     config.EXTRACTION_VERSION, require_raw_source=False)) == 1)
+
+            # Overview + what's new
+            scraper.analyze_pending_sections()
+            summarized = rdb.get_filing_by_accession("0000000037-24-000001")
+            test("Filing overview explains what the filing is",
+                 len(summarized["filing_overview"]) > 40 and
+                 "Coinbase" in summarized["filing_overview"],
+                 summarized["filing_overview"][:90])
+            test("Risk summary is still produced alongside the overview",
+                 len(summarized["risk_summary"]) > 40)
+            test("First filing for a filer has no what's-new diff",
+                 summarized["whats_new"] == "")
+
+            ibit_raw = load_sec_fixture("ibit_2024_424b3_excerpt.txt")
+            later = extract_exact_risk_sections(ibit_raw, "424B3")[0]
+            rdb.get_connection().execute("""
+                INSERT INTO filings (accession_no,cik,company_name,ticker,form_type,
+                 root_form,filing_date,filing_category,tier,sec_url,crypto_connection,
+                 search_keyword,fetched_at,processed_at,extraction_version,entity_type)
+                VALUES ('0000000037-25-000003','1679788','Coinbase Global Inc','COIN',
+                 '10-K','10-K','2025-02-15','Operating Co.',2,'https://sec.gov/y',
+                 'bitcoin','bitcoin','2025-02-15','2025-02-15',?,'Exchange')
+            """, (config.EXTRACTION_VERSION,))
+            rdb.replace_sections("0000000037-25-000003", [{
+                "section_type": "risk_factors", "method": "exact_item_1a",
+                "title": "Risk Factors", "text": later["text"], "confidence": 0.95,
+                "source_doc_name": "y.htm", "source_doc_url": "https://sec.gov/y.htm",
+                "source_hash": "c" * 64, "exact_text_hash": later["exact_text_hash"],
+                "start_offset": later["start_offset"], "end_offset": later["end_offset"],
+            }])
+            rdb.commit()
+            scraper.analyze_pending_sections()
+            newer = rdb.get_filing_by_accession("0000000037-25-000003")
+            test("Later filing gets a what's-new diff against the prior one",
+                 "prior" in newer["whats_new"].lower() and "2024-02-15" in newer["whats_new"],
+                 newer["whats_new"][:110])
+            test("What's-new is derived from the DB, not the network",
+                 rdb.get_prior_filing_section(
+                     "1679788", "10-K", "2025-02-15",
+                     exclude_accession="0000000037-25-000003",
+                 )["accession_no"] == "0000000037-24-000001")
+        finally:
+            from crypto_tracker import database as rdb
+            if hasattr(rdb._local, "conn") and rdb._local.conn is not None:
+                rdb._local.conn.close()
+                rdb._local.conn = None
+            rdb._init_done = False
+            for key, value in old_paths.items():
+                setattr(config, key, value)
+
     # ── Summary ──────────────────────────────────────────────────────────
     passed = sum(1 for _, ok, _ in results if ok)
     failed = sum(1 for _, ok, _ in results if not ok)

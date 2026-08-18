@@ -4,44 +4,44 @@
 {% block content %}
 <!-- STAT CARDS -->
 <div class="stat-grid">
-    <div class="card stat-card" style="border-top-color:#a5b4fc;">
-        <div class="stat-label">EXACT SECTIONS</div>
-        <div class="stat-value" style="color:#a5b4fc;">{{ stats.total }}</div>
+    <div class="card stat-card stat-card--navy">
+        <div class="stat-label">Exact Sections</div>
+        <div class="stat-value">{{ stats.total }}</div>
     </div>
-    <div class="card stat-card" style="border-top-color:#86efac;">
-        <div class="stat-label">COMPANIES</div>
-        <div class="stat-value" style="color:#86efac;">{{ stats.companies }}</div>
+    <div class="card stat-card stat-card--blue">
+        <div class="stat-label">Companies</div>
+        <div class="stat-value">{{ stats.companies }}</div>
     </div>
-    <div class="card stat-card" style="border-top-color:#f9a8d4;">
-        <div class="stat-label">ETF / FUND</div>
-        <div class="stat-value" style="color:#f9a8d4;">{{ stats.etf_count }}</div>
+    <div class="card stat-card stat-card--blue">
+        <div class="stat-label">ETF / Fund</div>
+        <div class="stat-value">{{ stats.etf_count }}</div>
     </div>
-    <div class="card stat-card" style="border-top-color:#fcd34d;">
-        <div class="stat-label">OPERATING CO.</div>
-        <div class="stat-value" style="color:#fcd34d;">{{ stats.oper_count }}</div>
+    <div class="card stat-card stat-card--navy">
+        <div class="stat-label">Operating Co.</div>
+        <div class="stat-value">{{ stats.oper_count }}</div>
     </div>
-    <div class="card stat-card" style="border-top-color:#67e8f9;">
-        <div class="stat-label">ANALYZED</div>
-        <div class="stat-value" style="color:#67e8f9;">{{ stats.analysis_complete }}</div>
+    <div class="card stat-card stat-card--green">
+        <div class="stat-label">Analyzed</div>
+        <div class="stat-value">{{ stats.analysis_complete }}</div>
     </div>
-    <div class="card stat-card" style="border-top-color:#fca5a5;">
-        <div class="stat-label">ANALYSIS PENDING</div>
-        <div class="stat-value" style="color:#fca5a5;">{{ stats.analysis_pending }}</div>
+    <div class="card stat-card stat-card--amber">
+        <div class="stat-label">Analysis Pending</div>
+        <div class="stat-value">{{ stats.analysis_pending }}</div>
     </div>
 </div>
 
 <!-- FILTER BAR (shown when a chart element is clicked) -->
 <div id="filter-bar" class="filter-bar" style="display:none;">
-    <span class="filter-label">FILTERED BY:</span>
+    <span class="filter-label">Filtered by:</span>
     <span class="filter-value" id="filter-text"></span>
-    <button class="btn-clear" onclick="clearFilter()">&#10005; CLEAR</button>
+    <button class="btn-clear" onclick="clearFilter()">&#10005; Clear</button>
 </div>
 
 <!-- CHARTS ROW 1 -->
 <div class="chart-grid">
     <div class="card chart-card">
         <div class="card-title">
-            MONTHLY FILINGS <span class="card-hint">(click a bar to filter)</span>
+            Monthly Filings <span class="card-hint">(click a bar to filter)</span>
         </div>
         <div class="chart-frame chart-frame--short">
             <canvas id="chart-monthly" aria-label="Monthly filings bar chart"></canvas>
@@ -49,7 +49,7 @@
     </div>
     <div class="card chart-card">
         <div class="card-title">
-            CATEGORY MIX <span class="card-hint">(click a bar to filter)</span>
+            Category Mix <span class="card-hint">(click a bar to filter)</span>
         </div>
         <div class="chart-frame chart-frame--short">
             <canvas id="chart-category" aria-label="Filing category comparison bar chart"></canvas>
@@ -61,7 +61,7 @@
 <div class="chart-grid">
     <div class="card chart-card">
         <div class="card-title">
-            TOP COMPANIES <span class="card-hint">(click to filter)</span>
+            Top Companies <span class="card-hint">(click to filter)</span>
         </div>
         <div class="chart-frame chart-frame--tall">
             <canvas id="chart-companies" aria-label="Top companies horizontal bar chart"></canvas>
@@ -69,7 +69,7 @@
     </div>
     <div class="card chart-card">
         <div class="card-title">
-            SEARCH KEYWORDS <span class="card-hint">(click to filter)</span>
+            Search Keywords <span class="card-hint">(click to filter)</span>
         </div>
         <div class="chart-frame chart-frame--tall">
             <canvas id="chart-keywords" aria-label="Search keyword bar chart"></canvas>
@@ -77,10 +77,20 @@
     </div>
 </div>
 
-<!-- FORM TYPES TABLE (clickable rows) -->
-<div class="card" style="margin-bottom:12px;">
+<!-- DAILY ACTIVITY -->
+<div class="card chart-card">
     <div class="card-title">
-        FORM TYPES <span class="card-hint">(click a row to filter)</span>
+        Recent Filing Activity <span class="card-hint">(count per filing date, 30 most recent dates with saved sections)</span>
+    </div>
+    <div class="chart-frame chart-frame--short chart-frame--static">
+        <canvas id="chart-daily" aria-label="Filings per day for the 30 most recent filing dates"></canvas>
+    </div>
+</div>
+
+<!-- FORM TYPES TABLE (clickable rows) -->
+<div class="card">
+    <div class="card-title">
+        Form Types <span class="card-hint">(click a row to filter)</span>
     </div>
     <table>
         <thead>
@@ -88,7 +98,7 @@
                 <th>Category</th>
                 <th>Form</th>
                 <th>Description</th>
-                <th style="text-align:right;">Count</th>
+                <th class="num">Count</th>
             </tr>
         </thead>
         <tbody>
@@ -102,7 +112,7 @@
                     </span>
                 </td>
                 <td class="cell">{{ form_desc.get(ft.form_type, ft.form_type) }}</td>
-                <td class="cell" style="text-align:right;font-weight:700;">{{ ft.count }}</td>
+                <td class="cell num-strong">{{ ft.count }}</td>
             </tr>
             {% endfor %}
         </tbody>
@@ -111,7 +121,7 @@
 
 <!-- FILTERED FILINGS TABLE -->
 <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <div class="card-toolbar">
         <div class="card-title" id="table-label">ALL FILINGS ({{ stats.total }})</div>
         <input id="search-box" class="search-input" placeholder="Search filings..."
                aria-label="Search filings in the dashboard table"
@@ -136,7 +146,7 @@
         </table>
     </div>
     <div id="table-empty" class="empty-state" style="display:none;">
-        No filings match the current filter. Click "CLEAR" above or try a different filter.
+        No filings match the current filter. Click "Clear" above or try a different filter.
     </div>
 </div>
 {% endblock %}
@@ -152,6 +162,10 @@ const compLabels = {{ stats.top_companies | map(attribute='company_name') | list
 const compValues = {{ stats.top_companies | map(attribute='count') | list | tojson }};
 const kwLabels = {{ stats.keywords | map(attribute='search_keyword') | list | tojson }};
 const kwValues = {{ stats.keywords | map(attribute='count') | list | tojson }};
+// Server returns the 30 most recent dates newest-first; reverse for a time axis.
+const dailyRaw = {{ stats.daily | tojson }};
+const dailyLabels = dailyRaw.map(d => (d.filing_date || '').slice(0, 10)).reverse();
+const dailyValues = dailyRaw.map(d => d.count).reverse();
 
 // Truncate long company names for chart labels
 const compLabelsShort = compLabels.map(c => c.length > 30 ? c.slice(0, 28) + '...' : c);
@@ -163,6 +177,7 @@ let activeFilterValue = null;
 function applyFilter(type, value, label) {
     activeFilterType = type;
     activeFilterValue = value;
+    // #filter-bar is a flex row — it MUST be restored to 'flex', not 'block'.
     document.getElementById('filter-bar').style.display = 'flex';
     document.getElementById('filter-text').textContent = label;
     setUrlFilter(type, value);
@@ -208,6 +223,7 @@ function hydrateFilterFromUrl() {
 function textFilter() {
     const q = document.getElementById('search-box').value.toLowerCase();
     document.querySelectorAll('#filing-tbody tr').forEach(tr => {
+        // '' restores the default row display — do not substitute 'block'.
         tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
     });
 }
@@ -239,6 +255,9 @@ function loadFilings() {
                 : `ALL FILINGS (${filings.length})`;
             label.textContent = filterLabel;
 
+            // NOTE: this markup is coupled to the CSS classes `cell`, `link`,
+            // `badge badge-*` and `summary-cell`, and to the 7-column <thead>
+            // rendered above. Renaming any of them requires editing both.
             tbody.innerHTML = filings.map(f => {
                 const formClass = getBadgeClass(f.form_type);
                 const summary = f.risk_summary || 'Analysis pending. Exact risk section is saved.';
@@ -271,6 +290,9 @@ function escHtml(str) {
     return d.innerHTML;
 }
 
+// NOTE: this mapping is deliberately coarser than the Jinja filter chain
+// (form_type|replace('/','')|replace('-','')|lower). style.css defines rules
+// for BOTH sets of class names, so either producer renders correctly.
 function getBadgeClass(formType) {
     if (!formType) return 'badge-other';
     if (formType.includes('10-K')) return 'badge-10k';
@@ -282,10 +304,35 @@ function getBadgeClass(formType) {
     return 'badge-other';
 }
 
-// ═══════════════ CHART SETUP ═══════════════
-Chart.defaults.color = '#94a3b8';
-Chart.defaults.borderColor = '#1e293b';
-Chart.defaults.font.family = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+// ═══════════════ CHART THEME ═══════════════
+// Light-theme palette derived from the navy/blue brand family plus the
+// semantic accents defined in style.css. Readable on white, no neon.
+const CHART_TEXT = '#5b6673';   /* --text-muted   */
+const CHART_GRID = '#d6dae0';   /* --border       */
+const CHART_NAVY = '#26527d';   /* --fred-navy    */
+const CHART_BLUE = '#4572a7';   /* --fred-blue    */
+const CHART_FONT = '"Helvetica Neue", Helvetica, Arial, "Liberation Sans", sans-serif';
+
+const CATEGORICAL = [
+    '#26527d', /* navy        */
+    '#8a6100', /* amber       */
+    '#1e6b3a', /* green       */
+    '#a32020', /* red         */
+    '#4572a7', /* blue        */
+    '#5b6673', /* gray        */
+    '#1b3c5c', /* navy dark   */
+    '#6b4a7a', /* muted plum  */
+    '#2f7d8a', /* muted teal  */
+    '#8a939e'  /* faint gray  */
+];
+// Bars use a slightly softened fill and go solid on hover.
+const fill = hex => hex + 'CC';
+const cycle = (n, from) => Array.from({ length: n }, (_, i) => from[i % from.length]);
+
+Chart.defaults.color = CHART_TEXT;
+Chart.defaults.borderColor = CHART_GRID;
+Chart.defaults.font.family = CHART_FONT;
+Chart.defaults.font.size = 12;
 
 const valueLabelPlugin = {
     id: 'valueLabelPlugin',
@@ -293,8 +340,8 @@ const valueLabelPlugin = {
         if (!['bar'].includes(chart.config.type)) return;
         const { ctx } = chart;
         ctx.save();
-        ctx.fillStyle = '#cbd5e1';
-        ctx.font = '600 10px JetBrains Mono, monospace';
+        ctx.fillStyle = CHART_TEXT;
+        ctx.font = '600 12px ' + CHART_FONT;
         ctx.textBaseline = 'middle';
         chart.data.datasets.forEach((dataset, datasetIndex) => {
             const meta = chart.getDatasetMeta(datasetIndex);
@@ -319,11 +366,11 @@ new Chart(document.getElementById('chart-monthly'), {
         labels: monthlyLabels,
         datasets: [{
             data: monthlyValues,
-            backgroundColor: '#6366f160',
-            hoverBackgroundColor: '#6366f1',
-            borderColor: '#6366f1',
+            backgroundColor: fill(CHART_NAVY),
+            hoverBackgroundColor: CHART_NAVY,
+            borderColor: CHART_NAVY,
             borderWidth: 1,
-            borderRadius: 3
+            borderRadius: 0
         }]
     },
     options: {
@@ -332,8 +379,8 @@ new Chart(document.getElementById('chart-monthly'), {
         layout: { padding: { top: 18 } },
         plugins: { legend: { display: false }, tooltip: { enabled: true } },
         scales: {
-            x: { ticks: { font: { size: 10 }, maxRotation: 45 } },
-            y: { beginAtZero: true, ticks: { precision: 0 } }
+            x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45 } },
+            y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: CHART_GRID } }
         },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
@@ -353,11 +400,11 @@ new Chart(document.getElementById('chart-category'), {
         labels: catLabels,
         datasets: [{
             data: catValues,
-            backgroundColor: ['#ec489960', '#f59e0b60', '#64748b60'],
-            hoverBackgroundColor: ['#ec4899', '#f59e0b', '#64748b'],
-            borderColor: ['#ec4899', '#f59e0b', '#64748b'],
+            backgroundColor: cycle(catLabels.length, CATEGORICAL).map(fill),
+            hoverBackgroundColor: cycle(catLabels.length, CATEGORICAL),
+            borderColor: cycle(catLabels.length, CATEGORICAL),
             borderWidth: 1,
-            borderRadius: 3
+            borderRadius: 0
         }]
     },
     options: {
@@ -367,8 +414,8 @@ new Chart(document.getElementById('chart-category'), {
         layout: { padding: { right: 28 } },
         plugins: { legend: { display: false }, tooltip: { enabled: true } },
         scales: {
-            x: { beginAtZero: true, ticks: { precision: 0 } },
-            y: { ticks: { font: { size: 11 } } }
+            x: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: CHART_GRID } },
+            y: { grid: { display: false }, ticks: { font: { size: 12 } } }
         },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
@@ -388,11 +435,11 @@ new Chart(document.getElementById('chart-companies'), {
         labels: compLabelsShort,
         datasets: [{
             data: compValues,
-            backgroundColor: '#8b5cf660',
-            hoverBackgroundColor: '#8b5cf6',
-            borderColor: '#8b5cf6',
+            backgroundColor: fill(CHART_BLUE),
+            hoverBackgroundColor: CHART_BLUE,
+            borderColor: CHART_BLUE,
             borderWidth: 1,
-            borderRadius: 3
+            borderRadius: 0
         }]
     },
     options: {
@@ -402,8 +449,8 @@ new Chart(document.getElementById('chart-companies'), {
         layout: { padding: { right: 28 } },
         plugins: { legend: { display: false }, tooltip: { enabled: true } },
         scales: {
-            x: { beginAtZero: true, ticks: { precision: 0 } },
-            y: { ticks: { font: { size: 10 } } }
+            x: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: CHART_GRID } },
+            y: { grid: { display: false }, ticks: { font: { size: 11 } } }
         },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
@@ -417,22 +464,17 @@ new Chart(document.getElementById('chart-companies'), {
 });
 
 // Keywords bar chart
-const kwColors = ['#6366f180','#22c55e80','#f59e0b80','#ef444480',
-                  '#8b5cf680','#ec489980','#06b6d480','#64748b80',
-                  '#a78bfa80','#fbbf2480'];
-const kwHover = ['#6366f1','#22c55e','#f59e0b','#ef4444',
-                 '#8b5cf6','#ec4899','#06b6d4','#64748b',
-                 '#a78bfa','#fbbf24'];
-
 new Chart(document.getElementById('chart-keywords'), {
     type: 'bar',
     data: {
         labels: kwLabels,
         datasets: [{
             data: kwValues,
-            backgroundColor: kwColors.slice(0, kwLabels.length),
-            hoverBackgroundColor: kwHover.slice(0, kwLabels.length),
-            borderRadius: 3
+            backgroundColor: cycle(kwLabels.length, CATEGORICAL).map(fill),
+            hoverBackgroundColor: cycle(kwLabels.length, CATEGORICAL),
+            borderColor: cycle(kwLabels.length, CATEGORICAL),
+            borderWidth: 1,
+            borderRadius: 0
         }]
     },
     options: {
@@ -441,8 +483,8 @@ new Chart(document.getElementById('chart-keywords'), {
         layout: { padding: { top: 18 } },
         plugins: { legend: { display: false }, tooltip: { enabled: true } },
         scales: {
-            x: { ticks: { font: { size: 10 }, maxRotation: 45 } },
-            y: { beginAtZero: true, ticks: { precision: 0 } }
+            x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45 } },
+            y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: CHART_GRID } }
         },
         onClick: (evt, elements) => {
             if (elements.length > 0) {
@@ -453,6 +495,34 @@ new Chart(document.getElementById('chart-keywords'), {
         }
     },
     plugins: [valueLabelPlugin]
+});
+
+// Recent daily activity (read-only time series; no click filter for single days)
+new Chart(document.getElementById('chart-daily'), {
+    type: 'line',
+    data: {
+        labels: dailyLabels,
+        datasets: [{
+            data: dailyValues,
+            borderColor: CHART_NAVY,
+            backgroundColor: CHART_NAVY + '1F',
+            borderWidth: 2,
+            pointRadius: 2,
+            pointBackgroundColor: CHART_NAVY,
+            pointBorderColor: '#ffffff',
+            tension: 0,
+            fill: true
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+            x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45, autoSkipPadding: 12 } },
+            y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: CHART_GRID } }
+        }
+    }
 });
 
 // Load initial filing table

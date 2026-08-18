@@ -5,7 +5,7 @@
 <!-- PAGE HEADER -->
 <div class="page-header">
     <div>
-        <h1 class="page-title">ALL FILINGS</h1>
+        <h1 class="page-title">All Filings</h1>
         <p class="page-subtitle">
             Showing {{ page_offset + 1 if filings else 0 }}-{{ page_offset + filings | length }} |
             Filterable by date, company, type |
@@ -31,7 +31,7 @@
 <!-- ACTIVE FILTERS -->
 {% if active_filters %}
 <div class="filter-bar" style="display:flex;">
-    <span class="filter-label">FILTERED BY:</span>
+    <span class="filter-label">Filtered by:</span>
     {% for key, val in active_filters.items() %}
     <span class="filter-tag">
         {{ key }}: {{ val }}
@@ -39,7 +39,7 @@
            class="filter-tag-remove">&#10005;</a>
     </span>
     {% endfor %}
-    <a href="/filings" class="btn-clear">&#10005; CLEAR ALL</a>
+    <a href="/filings" class="btn-clear">&#10005; Clear all</a>
 </div>
 {% endif %}
 
@@ -91,15 +91,15 @@
                     {% if f.extraction_confidence %}
                     &middot;
                     {% if f.extraction_confidence >= 0.7 %}
-                        <span style="color:#86efac;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                        <span class="status-ok">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
                     {% elif f.extraction_confidence >= 0.4 %}
-                        <span style="color:#fcd34d;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                        <span class="status-warn">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
                     {% else %}
-                        <span style="color:#fca5a5;">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
+                        <span class="status-bad">{{ '{:.0%}'.format(f.extraction_confidence) }}</span>
                     {% endif %}
                     {% endif %}
                     {% if f.extraction_method %}
-                    &middot; <span style="color:#64748b;">{{ f.extraction_method }}</span>
+                    &middot; <span class="text-muted">{{ f.extraction_method }}</span>
                     {% endif %}
                 </span>
             </div>
@@ -133,8 +133,21 @@
             {% endif %}
         </div>
 
+        <!-- Plain-English overview (degrades gracefully until the backend
+             adds filing_overview to v_filings_display) -->
+        {% if f.filing_overview %}
+        <div class="info-label">What this filing is</div>
+        <div class="info-box info-box--overview">{{ f.filing_overview }}</div>
+        {% endif %}
+
+        <!-- What changed relative to prior filings -->
+        {% if f.whats_new %}
+        <div class="info-label">What's new in this filing</div>
+        <div class="info-box info-box--new">{{ f.whats_new }}</div>
+        {% endif %}
+
         <!-- Risk Summary -->
-        <div class="risk-summary-label">ANALYSIS STATUS</div>
+        <div class="risk-summary-label">Risk factor summary</div>
         <div class="risk-summary-box">
             {% if f.risk_summary %}
             {{ f.risk_summary }}
@@ -149,9 +162,12 @@
         <!-- Risk Section Dropdown -->
         {% if f.risk_section and f.risk_section | length > 40 %}
         <div class="risk-dropdown">
-            <button class="btn-risk-toggle" onclick="toggleRisk({{ loop.index }})">
-                <span id="arrow-{{ loop.index }}">&#9654;</span> Show Exact Risk Section
-                <span style="color:#64748b;font-weight:400;margin-left:4px;">({{ '{:,}'.format(f.risk_section | length) }} chars)</span>
+            <button id="risk-toggle-{{ loop.index }}" class="btn-risk-toggle"
+                    onclick="toggleRisk({{ loop.index }})"
+                    aria-expanded="false" aria-controls="risk-{{ loop.index }}">
+                <span id="arrow-{{ loop.index }}" aria-hidden="true">&#9654;</span>
+                <span id="risk-label-{{ loop.index }}">Show Exact Risk Section</span>
+                <span class="btn-note">({{ '{:,}'.format(f.risk_section | length) }} chars)</span>
             </button>
             <a class="btn btn-sm" href="/api/filing/{{ f.accession_no }}/exact-risk.txt"
                title="Download exact source-backed risk text">Exact TXT</a>
@@ -163,7 +179,7 @@
                  data-url="/api/filing/{{ f.accession_no }}/exact-risk.txt"
                  data-loaded="0"
                  style="display:none;">
-                <div style="color:#64748b;">Loading exact text...</div>
+                <div class="note-loading">Loading exact text...</div>
             </div>
         </div>
         {% endif %}
@@ -193,7 +209,7 @@
         Showing {{ page_offset + 1 }}-{{ page_offset + filings | length }}
         filing{{ 's' if filings | length != 1 else '' }}
     </span>
-    <span style="display:inline-flex;gap:8px;margin-left:12px;">
+    <span class="pagination-links">
         {% if prev_url %}
         <a href="{{ prev_url }}" class="btn btn-sm">Previous</a>
         {% endif %}
@@ -207,30 +223,35 @@
 
 {% block scripts %}
 <script>
+// Every piece of the toggle is addressed by its own id — no reliance on
+// child-node positions or parentElement. #risk-N is a block-level panel and
+// must be restored with display:'block'.
 function toggleRisk(idx) {
     const el = document.getElementById('risk-' + idx);
     const arrow = document.getElementById('arrow-' + idx);
-    const btn = arrow.parentElement;
-    if (el.style.display === 'none') {
-        el.style.display = 'block';
-        arrow.innerHTML = '&#9660;';
-        btn.childNodes[1].textContent = ' Hide Risk Section';
-        if (el.dataset.loaded !== '1') {
-            fetch(el.dataset.url)
-                .then(r => r.text())
-                .then(text => {
-                    el.dataset.loaded = '1';
-                    el.innerHTML = '<pre style="white-space:pre-wrap;margin:0;font:inherit;">'
-                        + escapeHtml(text) + '</pre>';
-                })
-                .catch(() => {
-                    el.innerHTML = '<div style="color:#fca5a5;">Could not load exact text.</div>';
-                });
-        }
-    } else {
-        el.style.display = 'none';
-        arrow.innerHTML = '&#9654;';
-        btn.childNodes[1].textContent = ' Show Exact Risk Section';
+    const label = document.getElementById('risk-label-' + idx);
+    const btn = document.getElementById('risk-toggle-' + idx);
+    if (!el) return;
+
+    const hidden = el.style.display === 'none';
+    el.style.display = hidden ? 'block' : 'none';
+    if (arrow) arrow.innerHTML = hidden ? '&#9660;' : '&#9654;';
+    if (label) label.textContent = hidden ? 'Hide Risk Section' : 'Show Exact Risk Section';
+    if (btn) btn.setAttribute('aria-expanded', hidden ? 'true' : 'false');
+
+    if (hidden && el.dataset.loaded !== '1') {
+        fetch(el.dataset.url)
+            .then(r => {
+                if (!r.ok) throw new Error('bad response');
+                return r.text();
+            })
+            .then(text => {
+                el.dataset.loaded = '1';
+                el.innerHTML = '<pre class="exact-text">' + escapeHtml(text) + '</pre>';
+            })
+            .catch(() => {
+                el.innerHTML = '<div class="note-error">Could not load exact text.</div>';
+            });
     }
 }
 

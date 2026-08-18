@@ -4,15 +4,15 @@
 {% block content %}
 <div class="page-header">
     <div>
-        <h1 class="page-title">SETTINGS</h1>
+        <h1 class="page-title">Settings</h1>
         <p class="page-subtitle">Configuration, API keys, and system information</p>
     </div>
 </div>
 
 <!-- VERSION INFO -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">VERSION</div>
-    <div class="detail-grid" style="margin-top:8px;">
+<div class="card">
+    <div class="card-title">Version</div>
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Version</div>
             <div class="detail-value">v{{ config.VERSION }}</div>
@@ -29,12 +29,12 @@
 </div>
 
 <!-- EDGAR IDENTITY -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">SEC EDGAR IDENTITY</div>
-    <p style="font-size:10px;color:#64748b;margin:4px 0 8px 0;">
+<div class="card">
+    <div class="card-title">SEC EDGAR Identity</div>
+    <p class="card-note">
         Required by SEC fair-access policy. Used in all requests to EDGAR.
     </p>
-    <div class="detail-grid" style="margin-top:8px;">
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Identity</div>
             <div class="detail-value">{{ config.SEC_IDENTITY }}</div>
@@ -43,21 +43,21 @@
 </div>
 
 <!-- API KEYS -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">API KEYS</div>
-    <p style="font-size:10px;color:#64748b;margin:4px 0 8px 0;">
+<div class="card">
+    <div class="card-title">API Keys</div>
+    <p class="card-note">
         Optional. Set API keys in config.py or as environment variables.
         Without API keys, the app uses free extractive summarization.
     </p>
-    <div class="detail-grid" style="margin-top:8px;">
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Anthropic API Key</div>
             <div class="detail-value">
                 {% if config.ANTHROPIC_API_KEY %}
-                <span style="color:#86efac;">Configured</span>
+                <span class="status-ok">Configured</span>
                 ({{ config.ANTHROPIC_API_KEY[:8] }}...)
                 {% else %}
-                <span style="color:#64748b;">Not set</span>
+                <span class="text-muted">Not set</span>
                 — using extractive summarization
                 {% endif %}
             </div>
@@ -70,9 +70,9 @@
 </div>
 
 <!-- SCRAPING PARAMETERS -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">SCRAPING PARAMETERS</div>
-    <div class="detail-grid" style="margin-top:8px;">
+<div class="card">
+    <div class="card-title">Scraping Parameters</div>
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Date Range</div>
             <div class="detail-value">{{ config.START_DATE }} to {{ config.END_DATE }}</div>
@@ -94,17 +94,17 @@
             <div class="detail-value">{{ config.DEFAULT_SCRAPE_SCOPE }}</div>
         </div>
     </div>
-    <div style="margin-top:12px;">
+    <div class="tag-block">
         <div class="detail-label">Search Keywords</div>
-        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
+        <div class="tag-list">
             {% for kw in config.KEYWORDS %}
             <span class="badge badge-other">{{ kw }}</span>
             {% endfor %}
         </div>
     </div>
-    <div style="margin-top:12px;">
+    <div class="tag-block">
         <div class="detail-label">Form Types</div>
-        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
+        <div class="tag-list">
             {% for ft in config.RISK_DEFAULT_FORM_TYPES %}
             <span class="badge badge-etf">{{ ft }}</span>
             {% endfor %}
@@ -113,12 +113,12 @@
 </div>
 
 <!-- DATABASE INFO -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">DATABASE</div>
-    <div class="detail-grid" style="margin-top:8px;">
+<div class="card">
+    <div class="card-title">Database</div>
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Path</div>
-            <div class="detail-value" style="font-size:10px;word-break:break-all;">{{ config.DB_PATH }}</div>
+            <div class="detail-value detail-value--path">{{ config.DB_PATH }}</div>
         </div>
         <div class="detail-item">
             <div class="detail-label">Total Filings</div>
@@ -127,28 +127,75 @@
         <div class="detail-item">
             <div class="detail-label">Export</div>
             <div class="detail-value">
-                <a href="/api/export/csv" class="btn btn-sm">CSV</a>
-                <a href="/api/export/xlsx" class="btn btn-sm" style="margin-left:4px;">Excel</a>
+                <span class="btn-group">
+                    <a href="/api/export/csv" class="btn btn-sm">CSV</a>
+                    <a href="/api/export/xlsx" class="btn btn-sm">Excel</a>
+                </span>
+            </div>
+        </div>
+        <div class="detail-item">
+            <div class="detail-label">Stored Source</div>
+            <div class="detail-value">
+                <span class="num-strong">{{ '{:,}'.format(raw_source.with_raw_source) }}</span>
+                <span class="text-muted">of {{ '{:,}'.format(raw_source.total_filings) }} filings</span>
+                {% if raw_source.stored_bytes %}
+                <span class="text-faint">
+                    ({{ '{:,.0f}'.format(raw_source.stored_bytes / 1048576) }} MB stored)
+                </span>
+                {% endif %}
+                <div class="detail-hint">
+                    Filings with raw source in the database can be re-extracted
+                    offline, with no SEC requests.
+                </div>
+            </div>
+        </div>
+        {% if raw_source.missing_raw_source %}
+        <div class="detail-item">
+            <div class="detail-label">Backfill Source</div>
+            <div class="detail-value">
+                <button onclick="backfillSource()" class="btn btn-sm btn-accent">
+                    Backfill {{ '{:,}'.format(raw_source.missing_raw_source) }} Filings
+                </button>
+                <div class="detail-hint">
+                    One-time catch-up for filings stored before v1.1.37. Reads the
+                    local cache first, contacts SEC only when it must. After this,
+                    regeneration never needs the network.
+                </div>
+            </div>
+        </div>
+        {% endif %}
+        <div class="detail-item">
+            <div class="detail-label">Regenerate</div>
+            <div class="detail-value">
+                <button onclick="regenerateStale()" class="btn btn-sm btn-accent">
+                    Rebuild Outdated
+                </button>
+                <div class="detail-hint">
+                    Rebuilds only filings behind extraction
+                    <code>{{ config.EXTRACTION_VERSION }}</code>, offline from stored
+                    source. Filings already current are left untouched.
+                </div>
             </div>
         </div>
         <div class="detail-item">
             <div class="detail-label">Reprocess Cached</div>
             <div class="detail-value">
-                <button onclick="reprocessCached()" class="btn btn-sm" style="background:#1e3a8a;border-color:#3b82f6;">
+                <button onclick="reprocessCached()" class="btn btn-sm btn-accent">
                     Re-Extract All
                 </button>
-                <div style="font-size:9px;color:#64748b;margin-top:2px;">
-                    Re-run cached exact extraction. Summaries can run separately.
+                <div class="detail-hint">
+                    Re-runs extraction on every cached filing, then analyzes.
+                    Prefer "Rebuild Outdated" — this one redoes work already current.
                 </div>
             </div>
         </div>
         <div class="detail-item">
             <div class="detail-label">Reset</div>
             <div class="detail-value">
-                <button onclick="resetDb()" class="btn btn-sm" style="background:#7f1d1d;border-color:#dc2626;">
+                <button onclick="resetDb()" class="btn btn-sm btn-danger">
                     Wipe Database
                 </button>
-                <div style="font-size:9px;color:#64748b;margin-top:2px;">
+                <div class="detail-hint">
                     Clears all filings. Run after extraction logic changes.
                 </div>
             </div>
@@ -157,25 +204,25 @@
 </div>
 
 <!-- DOCUMENTATION -->
-<div class="card" style="margin-bottom:12px;">
-    <div class="card-title">DOCUMENTATION</div>
-    <div style="margin-top:8px;font-size:11px;line-height:1.8;">
-        <div style="margin-bottom:8px;">
+<div class="card">
+    <div class="card-title">Documentation</div>
+    <div class="doc-body">
+        <div class="doc-item">
             <a href="https://github.com/penrose-is-goat/Claude-Code_02-Crypto-Tracker-" target="_blank" class="link">
                 GitHub Repository &rarr;
             </a>
         </div>
-        <div style="margin-bottom:8px;">
+        <div class="doc-item">
             <strong>Data Sources:</strong>
-            <ul style="margin-left:16px;margin-top:4px;color:#94a3b8;">
+            <ul>
                 <li><a href="https://efts.sec.gov/LATEST/" target="_blank" class="link">SEC EDGAR Full-Text Search (EFTS)</a></li>
                 <li><a href="https://www.sec.gov/digital-assets" target="_blank" class="link">SEC Digital Assets Page</a></li>
                 <li><a href="https://pypi.org/project/edgartools/" target="_blank" class="link">edgartools Python Library</a></li>
             </ul>
         </div>
-        <div>
+        <div class="doc-item">
             <strong>Architecture:</strong>
-            <span style="color:#94a3b8;">
+            <span class="text-muted">
                 Python/Flask backend + SQLite database + Jinja2 templates + Chart.js.
                 Uses edgartools for EDGAR API access. Filing documents parsed via
                 Filing.sections(), Filing.search(), and Attachment.text().
@@ -185,35 +232,71 @@
 </div>
 
 <script>
+// uiConfirm / uiAlert are defined in base.html and fall back to the native
+// window.confirm / window.alert if <dialog> is unavailable.
 function resetDb() {
-    if (!confirm("Wipe ALL filings from the database? You'll need to re-run Update Filings.")) return;
-    fetch('/api/reset', { method: 'POST' })
-        .then(r => r.json())
-        .then(d => { alert(d.message || 'Done'); location.reload(); });
+    uiConfirm("Wipe ALL filings from the database? You'll need to re-run Update Filings.", 'Wipe database')
+        .then(ok => {
+            if (!ok) return;
+            fetch('/api/reset', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => uiAlert(d.message || 'Done', 'Database').then(() => location.reload()));
+        });
 }
 function reprocessCached() {
-    if (!confirm("Re-run extraction and summary on all cached filings? This may take 5-15 minutes but doesn't re-download from SEC.")) return;
-    fetch('/api/reprocess', { method: 'POST' })
-        .then(r => r.json())
-        .then(d => {
-            if (d.error) { alert(d.error); return; }
-            alert('Reprocessing started. Watch the status bar for progress.');
-            location.reload();
+    uiConfirm("Re-run extraction and summary on all cached filings? This may take 5-15 minutes but doesn't re-download from SEC.", 'Reprocess cached filings')
+        .then(ok => {
+            if (!ok) return;
+            fetch('/api/reprocess', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.error) { uiAlert(d.error, 'Reprocess'); return; }
+                    uiAlert('Reprocessing started. Watch the status bar for progress.', 'Reprocess')
+                        .then(() => location.reload());
+                });
         });
+}
+function startReprocess(mode, confirmText, title) {
+    uiConfirm(confirmText, title).then(ok => {
+        if (!ok) return;
+        fetch('/api/reprocess?mode=' + mode, { method: 'POST' })
+            .then(r => r.json())
+            .then(d => {
+                if (d.error) { uiAlert(d.error, title); return; }
+                uiAlert('Started. Watch the status bar for progress.', title)
+                    .then(() => location.reload());
+            });
+    });
+}
+function backfillSource() {
+    startReprocess(
+        'backfill_source',
+        "Store raw source in the database for filings that don't have it yet? "
+        + "This reads the local cache first and contacts SEC only for what's missing, "
+        + "so it may take a while. Afterwards, rebuilds run fully offline.",
+        'Backfill stored source');
+}
+function regenerateStale() {
+    startReprocess(
+        'regenerate',
+        "Rebuild filings whose extraction is behind the current version? "
+        + "Runs offline from stored source — no SEC requests. Filings already "
+        + "current are skipped.",
+        'Rebuild outdated filings');
 }
 </script>
 
 <!-- SCRAPER STATUS -->
 <div class="card">
-    <div class="card-title">SCRAPER STATUS</div>
-    <div class="detail-grid" style="margin-top:8px;">
+    <div class="card-title">Scraper Status</div>
+    <div class="detail-grid detail-grid--spaced">
         <div class="detail-item">
             <div class="detail-label">Running</div>
             <div class="detail-value">
                 {% if scraper_status.running %}
-                <span style="color:#fcd34d;">Yes — {{ scraper_status.message }}</span>
+                <span class="status-warn">Yes — {{ scraper_status.message }}</span>
                 {% else %}
-                <span style="color:#86efac;">Idle</span>
+                <span class="status-ok">Idle</span>
                 {% endif %}
             </div>
         </div>

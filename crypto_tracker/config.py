@@ -1,5 +1,15 @@
 """
-Configuration for Crypto SEC Filing Tracker v1.1.36.
+Configuration for Crypto SEC Filing Tracker v1.1.37.
+
+v1.1.37 changes:
+- Raw filing source is now stored durably IN the database (gzip-compressed),
+  not only in a deletable filesystem cache. The DB is the single source of
+  truth: extraction can be re-derived offline with zero SEC traffic.
+- Per-filing extraction_version stamps let an update regenerate only the
+  filings a newer extractor would actually change, instead of all-or-nothing.
+- Filing overview + "what's new" (diffed against the prior filing of the
+  same company/form) alongside the risk-factor summary.
+- FRED-inspired light UI replacing the dark retro theme.
 
 v1.1.36 changes:
 - edgartools fallback is now bounded: low concurrency gate, its own rate
@@ -34,8 +44,8 @@ import os
 from datetime import datetime
 
 # ─── Version ──────────────────────────────────────────────────────────────
-VERSION = "1.1.36"
-VERSION_NAME = "Batch 1 — SEC Filing Tracker (bounded edgartools fallback)"
+VERSION = "1.1.37"
+VERSION_NAME = "Batch 1 — SEC Filing Tracker (database-derived, FRED UI)"
 
 # ─── Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -132,6 +142,26 @@ FAST_HTML_CLEAN_BYTES = 750_000
 
 # Bump when discovery/extraction skip decisions need to be re-audited.
 PROCESSOR_VERSION = f"{VERSION}-{TEXT_CACHE_VERSION}-skipstate-v2-cik-validated"
+
+# ─── Durable raw source + offline regeneration (v1.1.37) ─────────────────
+# Raw filing HTML is stored gzip-compressed in the DB so re-extraction never
+# needs SEC. RAW_DOC_CACHE_DIR remains a fast read-through cache, but it is
+# now expendable: wiping it costs speed, not data.
+STORE_RAW_SOURCE_IN_DB = True
+RAW_SOURCE_GZIP_LEVEL = 6         # ~10-15% of original size for SEC HTML
+RAW_SOURCE_MAX_BYTES = 25_000_000  # Skip absurd outliers rather than bloat the DB
+
+# EXTRACTION_VERSION stamps each stored section. An update run regenerates
+# only filings whose stamp is behind — from local raw source, no network.
+# Bump this (not VERSION) whenever extraction logic changes what gets stored.
+EXTRACTION_VERSION = f"{VERSION}-exact-v1"
+
+# Cap per regeneration pass so a version bump can't turn one click into an
+# unbounded job. 0 = no cap.
+REGENERATE_BATCH_LIMIT = 0
+# Regeneration is local-only by default: a filing with no stored raw source
+# is left alone rather than silently re-downloaded from SEC.
+REGENERATE_ALLOW_NETWORK = False
 
 # ─── Search Keywords ─────────────────────────────────────────────────────
 KEYWORDS = [
@@ -307,7 +337,11 @@ CORE_COMPANY_FORM_TYPES = ["10-K", "10-Q"]
 EVENT_RISK_COMPANY_FORM_TYPES = RISK_DEFAULT_COMPANY_FORM_TYPES + ["8-K"]
 ALL_COMPANY_FORM_TYPES = COMPANY_FORM_TYPES
 
-SCRAPE_MODES = {"exact_only", "analysis_only", "low_confidence_only", "all_cached"}
+SCRAPE_MODES = {
+    "exact_only", "analysis_only", "low_confidence_only", "all_cached",
+    "backfill_source",   # one-time: populate durable raw source for old filings
+    "regenerate",        # offline rebuild of filings behind EXTRACTION_VERSION
+}
 SCRAPE_SCOPES = {"risk_default", "core", "event_risk", "all"}
 DEFAULT_SCRAPE_MODE = "exact_only"
 DEFAULT_SCRAPE_SCOPE = "risk_default"
